@@ -1,0 +1,73 @@
+# ================= Python =================
+# 字节码缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+# 打包安装产物
+*.egg-info/
+*.egg
+*.whl
+pip-wheel-metadata/
+# 测试缓存与覆盖率
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pytype/
+.ruff_cache/
+.tox/
+.nox/
+# Jupyter
+.ipynb_checkpoints/
+*_nbconvert_*.ipynb
+
+# ================= PyInstaller 打包产物 =================
+dist/
+build/
+build_*/
+*.spec.bak
+*.log
+*.toc
+
+# ================= IDE / 编辑器 =================
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*.swn
+*.bak
+*.orig
+*~
+
+# ================= 系统 =================
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+*.lnk
+
+# ================= 临时演示/测试脚本（不随开源仓库提交） =================
+_*.png
+_*.jpg
+_*.txt
+_test_*.py
+diag_*.py
+output.png
+截图图片与性能测试图片/
+
+# ================= 测试素材（中文目录，任意层级） =================
+**/截图图片与性能测试图片/
+
+# ================= WorkBuddy 内部数据 =================
+.workbuddy/
+
+
+tests/
