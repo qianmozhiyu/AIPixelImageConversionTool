@@ -1,7 +1,6 @@
 # AIPixelImageConversionTool · AI 像素图转换工具
 
 > 该工具将 AI 扩散模型生成的伪像素图一键转换为规范像素图。
-> 
 > One‑click conversion of fake pixel art from AI diffusion models into clean standard pixel art. 
 
 [English](#english-summary) · [中文](#中文说明)
