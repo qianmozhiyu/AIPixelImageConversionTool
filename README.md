@@ -19,20 +19,16 @@
 ### 效果
 AI生成的像素图1
 
-![image01.jpg](src/images/image01.jpg)
 
-转化后
+<img src="src/images/image01.jpg" alt="AI原图" width="200">转化后<img src="src/images/image01_fix.png" alt="AI原图" width="200">
 
-![image01_fix.png](src/images/image01_fix.png)
 
 AI生成的像素图2
 
-![slice_09.jpg](src/images/image3.jpg)
+<img src="src/images/image3.jpg" alt="AI原图" width="200">转化后<img src="src/images/image03_fix.png" alt="AI原图" width="200">
 
-转化后
-
-![image03_fix.png](src/images/image03_fix.png)
-
+（部分 AI 生成的像素图转换仍存在误差，算法持续优化中）
+（Some AI‑generated pixel art may produce imperfect conversion results. The algorithm will be continuously optimized）
 ### 处理流程
 `输入图像 → 降噪 →（可选放大）→ 网格检测 → 块提取 → 调色板精炼 → 标准像素图`
 
