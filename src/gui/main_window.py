@@ -456,17 +456,15 @@ class MainWindow(QMainWindow):
 
         if key == "denoise":
             arr = stages["denoise_global"]
-            h, w = arr.shape[:2]
             self.canvas.set_image(np.clip(arr, 0, 255))
             self.canvas.set_grid_overlay(None)
-            self.canvas.set_info(f"降噪后 | 逻辑: {w}×{h}")
+            self.canvas.set_info("AI 降噪")
         elif key == "upscale":
             arr = stages.get("upscale")
             if arr is not None:
-                h, w = arr.shape[:2]
                 self.canvas.set_image(np.clip(arr, 0, 255))
                 self.canvas.set_grid_overlay(None)
-                self.canvas.set_info(f"放大后 | {w}×{h}")
+                self.canvas.set_info("放大")
             else:
                 self._show_original()
                 return
@@ -476,22 +474,20 @@ class MainWindow(QMainWindow):
             self.canvas.set_image(np.clip(arr, 0, 255))
             self.canvas.set_grid_overlay(grid)
             self.canvas.set_info(
-                f"网格: {meta['w_logic']}×{meta['h_logic']} | "
-                f"块: {meta['px']}×{meta['py']}px | 置信度: {meta['grid_conf']:.2f}"
+                f"网格: {meta['w_logic']}×{meta['h_logic']} 块 | "
+                f"块大小: {meta['px']}×{meta['py']}px | 置信度: {meta['grid_conf']:.2f}"
             )
         elif key == "extract":
             arr = stages["extract"]
-            h, w = arr.shape[:2]
             self.canvas.set_image(np.clip(arr, 0, 255))
             self.canvas.set_grid_overlay(None)
-            self.canvas.set_info(f"块提取 | 逻辑: {w}×{h}")
+            self.canvas.set_info("块提取")
         elif key == "palette_refine":
             arr = stages["palette_refine"]
-            h, w = arr.shape[:2]
             unique = len(np.unique(arr.reshape(-1, 3), axis=0))
             self.canvas.set_image(np.clip(arr, 0, 255))
             self.canvas.set_grid_overlay(None)
-            self.canvas.set_info(f"调色板精炼 | {w}×{h} | {unique}色")
+            self.canvas.set_info(f"调色板精炼 | {unique}色")
 
         # 每个阶段都可对比原图
         self._set_compare_visible(True)
@@ -543,11 +539,10 @@ class MainWindow(QMainWindow):
             self._preview_index = 0
         name, art, _orig = self._preview_items[self._preview_index]
         arr = np.clip(art, 0, 255).astype(np.uint8)
-        h, w = arr.shape[:2]
         self.canvas.set_image(arr)
         self.canvas.set_grid_overlay(None)
         unique = len(np.unique(arr.reshape(-1, 3), axis=0))
-        self.canvas.set_info(f"{name} | {w}×{h} | {unique}色")
+        self.canvas.set_info(f"{name} | {unique}色")
         self.canvas.fit_to_view()
         self.preview_page_label.setText(
             f"第 {self._preview_index + 1} / {len(self._preview_items)} 张"
@@ -778,9 +773,7 @@ class MainWindow(QMainWindow):
         self.canvas.set_image(result.pixel_art)
         self.canvas.set_grid_overlay(None)
         unique = meta.get("unique_colors", "?")
-        self.canvas.set_info(
-            f"逻辑: {meta['w_logic']}×{meta['h_logic']} | {unique}色"
-        )
+        self.canvas.set_info(f"完成 | {meta['w_logic']}×{meta['h_logic']} 像素块 | {unique}色")
         self.canvas.fit_to_view()
         self.status_label.setText("完成")
         self.progress_bar.setValue(100)

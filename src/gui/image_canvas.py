@@ -189,7 +189,9 @@ class ImageCanvas(QWidget):
             w = 0
             h = 0
         scale_percent = round(self._scale * 100)
-        text = f"{w}×{h} | {scale_percent}%"
+        # 信息栏统一标注"像素:"（图片实际像素尺寸），与阶段 info 中的
+        # "块大小/逻辑分辨率"明确区分，避免尺寸信息重复
+        text = f"像素: {w}×{h} | {scale_percent}%"
         if self._info:
             text += " | " + self._info
         # 左边距 8px，垂直居中，左对齐
