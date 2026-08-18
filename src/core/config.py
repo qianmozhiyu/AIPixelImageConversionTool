@@ -45,6 +45,7 @@ _FIELD_TYPES = {
 # 默认全局偏好
 _DEFAULT_PREFS = {
     "download_removes_asset": True,   # 下载后是否将资产移出"我的资产"
+    "auto_add_asset": False,          # 转换完成后是否自动移入资产库（默认关闭，需手动"放入资产库"）
     "default_output_dir": "",          # 默认输出文件夹
     "asset_store_dir": "",             # 资产存储位置（空=使用默认 ~/.aipixel/assets/）
     "undo_history_limit": 50,          # 像素编辑器撤销历史条数上限

@@ -85,6 +85,15 @@ class ImageCanvas(QWidget):
             self._offset = QPoint(0, 0)
             self.update()
 
+    def clear(self) -> None:
+        """清空画布内容（回到"无图片"提示状态）。"""
+        self._qimage = None
+        self._image = None
+        self._overlay_grid = None
+        self._scale = 1.0
+        self._offset = QPoint(0, 0)
+        self.update()
+
     def set_info(self, extra: str) -> None:
         """设置底部信息栏附加信息字符串，触发重绘。"""
         self._info = extra or ""
@@ -159,8 +168,14 @@ class ImageCanvas(QWidget):
                         painter.drawLine(QPoint(0, int(y)), QPoint(img_w, int(y)))
             painter.restore()
         else:
-            painter.setPen(Qt.GlobalColor.white)
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "无图像")
+            # 无图片：黑色背景 + 大字号提示
+            painter.fillRect(self.rect(), QColor(0, 0, 0))
+            font = painter.font()
+            font.setPointSize(26)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QColor(110, 110, 120))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "无图片")
 
         # 画布信息栏（底部 overlay）
         info_h = 22

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import time
 import uuid
@@ -21,6 +22,26 @@ from .io import load_image, save_image
 
 # 支持的图片扩展名
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def _dedupe_source_name(source_name: str, existing: set[str]) -> str:
+    """对资产名做重名去重编号：图片、图片(1)、图片(2)…
+
+    - 若传入名本身带尾部序号 ``(n)``（如 ``图片(1)``），先剥离出基础名
+      ``图片`` 再统一编号，避免嵌套序号（如 ``图片(1)(1)``）；
+    - 基础名未占用 → 直接使用基础名；
+    - 已占用 → 取最小可用序号 ``基础名(n)``。
+    """
+    m = re.match(r"^(.*)\((\d+)\)$", source_name)
+    base = m.group(1).rstrip() if m else source_name
+    if not base:
+        base = source_name
+    if base not in existing:
+        return base
+    n = 1
+    while f"{base}({n})" in existing:
+        n += 1
+    return f"{base}({n})"
 
 
 @dataclass
@@ -127,6 +148,10 @@ class AssetManager:
         self._make_thumbnail(image, self._thumb_path(asset_id))
 
         h, w = image.shape[:2]
+        # 重名自动编号（图片、图片(1)、图片(2)…）
+        source_name = _dedupe_source_name(
+            source_name, {a.source_name for a in self.list_assets()}
+        )
         info = AssetInfo(
             id=asset_id,
             source_name=source_name,

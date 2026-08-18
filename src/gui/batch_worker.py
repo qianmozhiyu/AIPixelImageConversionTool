@@ -13,6 +13,7 @@ from PySide6.QtCore import QThread, Signal
 from ..pipeline import Pipeline, PipelineParams
 from ..core.io import load_image
 from ..core.asset_manager import AssetManager
+from ..core.config import load_preference
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -22,7 +23,9 @@ class BatchWorker(QThread):
 
     Signals:
         progress(int, int, str): (current, total, filename) 进度更新
-        image_done(str): 单张完成（asset_id）
+        image_done(str): 单张完成（asset_id，auto_add_asset 开启时入库）
+        image_result(str, object, object): 单张结果（source_name, pixel_art,
+            original，auto_add_asset 关闭时发出，供预览确认）
         finished_all(int): 全部完成（成功数）
         error(str, str): 单张出错（filename, error_msg）
         cancelled()
@@ -30,6 +33,7 @@ class BatchWorker(QThread):
 
     progress = Signal(int, int, str)   # current, total, filename
     image_done = Signal(str)            # asset_id
+    image_result = Signal(str, object, object)  # source_name, pixel_art, original
     finished_all = Signal(int)          # success_count
     error = Signal(str, str)            # filename, error_msg
     cancelled = Signal()
@@ -68,6 +72,9 @@ class BatchWorker(QThread):
             return
 
         success = 0
+        # 是否自动移入资产库（设置项，默认关闭）
+        auto_add = load_preference("auto_add_asset", False)
+        auto_add = auto_add in (True, "true", "True", 1, "1")
         for i, img_path in enumerate(images):
             if self._cancelled:
                 self.cancelled.emit()
@@ -80,8 +87,11 @@ class BatchWorker(QThread):
                 pipeline = Pipeline(self._params)
                 result = pipeline.run(img)
                 source_name = img_path.stem
-                asset_id = self._asset_manager.add_asset(result.pixel_art, source_name)
-                self.image_done.emit(asset_id)
+                if auto_add:
+                    asset_id = self._asset_manager.add_asset(result.pixel_art, source_name)
+                    self.image_done.emit(asset_id)
+                # 始终发出结果供"预览"阶段收集（分页浏览、确认入库/重新生成）
+                self.image_result.emit(source_name, result.pixel_art, img)
                 success += 1
             except Exception as e:
                 self.error.emit(img_path.name, str(e))

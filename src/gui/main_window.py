@@ -43,13 +43,14 @@ from .assets_page import AssetsPage
 from .settings_page import SettingsPage
 
 
-STAGE_KEYS = ["denoise", "upscale", "grid_detect", "extract", "palette_refine"]
+STAGE_KEYS = ["denoise", "upscale", "grid_detect", "extract", "palette_refine", "preview"]
 STAGE_LABELS = {
     "denoise": "AI 降噪",
     "upscale": "放大",
     "grid_detect": "网格检测",
     "extract": "块提取",
     "palette_refine": "调色板精炼",
+    "preview": "预览",
 }
 # UI 阶段键 -> pipeline stages 字段名映射
 STAGE_TO_PIPELINE = {
@@ -206,33 +207,65 @@ class MainWindow(QMainWindow):
         # 左侧：阶段列表（序号 + 名称 + 状态点）
         self.stage_list = QListWidget()
         self.stage_list.setMinimumWidth(200)
-        for i, key in enumerate(STAGE_KEYS):
-            item = QListWidgetItem(f"{i+1}. {STAGE_LABELS[key]}  ●")
+        for key in STAGE_KEYS:
+            item = QListWidgetItem(f"{STAGE_LABELS[key]}  ●")
             item.setData(Qt.UserRole, key)
             self.stage_list.addItem(item)
         self.stage_list.currentRowChanged.connect(self._on_stage_changed)
 
-        # 右侧：参数面板（放入滚动区域）
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.param_panel)
+        # 右侧：参数面板（内部为单滚动面板，所有阶段参数一起显示）
 
-        # 中间：画布（调色板精炼阶段上方显示"对比原图"按钮）；用 QSplitter 组织三栏
+        # 中间：画布（上方显示"对比原图"按钮，所有阶段均可对比）；用 QSplitter 组织三栏
         canvas_wrap = QWidget()
         canvas_wrap_layout = QVBoxLayout(canvas_wrap)
         canvas_wrap_layout.setContentsMargins(0, 0, 0, 0)
         canvas_wrap_layout.setSpacing(4)
         self.compare_btn = QPushButton("对比原图")
         self.compare_btn.setCheckable(True)
-        self.compare_btn.setVisible(False)  # 仅调色板精炼阶段显示
+        self.compare_btn.setVisible(False)  # 有转换结果且选中阶段时显示
         self.compare_btn.toggled.connect(self._on_compare_toggled)
         canvas_wrap_layout.addWidget(self.compare_btn, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        # 预览阶段工具栏（分页 + 操作，仅"预览"阶段显示）
+        preview_toolbar = QHBoxLayout()
+        preview_toolbar.setSpacing(6)
+        self.preview_prev_btn = QPushButton("◀")
+        self.preview_next_btn = QPushButton("▶")
+        self.preview_page_label = QLabel("第 0 / 0 张")
+        self.preview_page_label.setStyleSheet("color: #aaa; font-size: 12px;")
+        self.preview_prev_btn.setFixedWidth(32)
+        self.preview_next_btn.setFixedWidth(32)
+        self.preview_prev_btn.clicked.connect(self._preview_prev)
+        self.preview_next_btn.clicked.connect(self._preview_next)
+        preview_toolbar.addWidget(self.preview_prev_btn)
+        preview_toolbar.addWidget(self.preview_page_label)
+        preview_toolbar.addWidget(self.preview_next_btn)
+        preview_toolbar.addStretch(1)
+        self.preview_regen_btn = QPushButton("重新生成")
+        self.preview_add_btn = QPushButton("加入资产库")
+        self.preview_del_btn = QPushButton("删除")
+        self.preview_add_all_btn = QPushButton("一键加入")
+        self.preview_clear_btn = QPushButton("一键清空")
+        self.preview_regen_btn.clicked.connect(self._preview_regen)
+        self.preview_add_btn.clicked.connect(self._preview_add_current)
+        self.preview_del_btn.clicked.connect(self._preview_delete_current)
+        self.preview_add_all_btn.clicked.connect(self._preview_add_all)
+        self.preview_clear_btn.clicked.connect(self._preview_clear_all)
+        preview_toolbar.addWidget(self.preview_regen_btn)
+        preview_toolbar.addWidget(self.preview_add_btn)
+        preview_toolbar.addWidget(self.preview_del_btn)
+        preview_toolbar.addWidget(self.preview_add_all_btn)
+        preview_toolbar.addWidget(self.preview_clear_btn)
+        self.preview_toolbar_widget = QWidget()
+        self.preview_toolbar_widget.setLayout(preview_toolbar)
+        self.preview_toolbar_widget.setVisible(False)
+        canvas_wrap_layout.addWidget(self.preview_toolbar_widget)
         canvas_wrap_layout.addWidget(self.canvas, 1)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.stage_list)
         splitter.addWidget(canvas_wrap)
-        splitter.addWidget(scroll)
+        splitter.addWidget(self.param_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
@@ -245,6 +278,11 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(False)
         self.start_btn.clicked.connect(self._on_start)
         self.cancel_btn.clicked.connect(self._on_cancel)
+        # 转换状态机：idle / running / done（待放入资产库）/ batch_running
+        self._conv_state = "idle"
+        # 预览阶段：收集单张与批量转换结果，分页浏览确认
+        self._preview_items: list[tuple[str, object, object]] = []  # (name, pixel_art, original)
+        self._preview_index = 0
         btn_layout = QHBoxLayout()
         btn_layout.addWidget(self.start_btn)
         btn_layout.addWidget(self.cancel_btn)
@@ -319,9 +357,10 @@ class MainWindow(QMainWindow):
         self.assets_page.refresh()
 
     def _on_settings_changed(self) -> None:
-        # 设置变更后重新加载参数
+        # 设置变更后重新加载参数（"恢复默认参数"等）；
+        # 需更新 param_panel 持有的引用，否则同步的仍是旧对象
         self.params = config.load_params()
-        self.param_panel.sync_from_params()
+        self.param_panel.set_params(self.params)
 
     def _build_menu(self) -> None:
         menubar = self.menuBar()
@@ -356,6 +395,11 @@ class MainWindow(QMainWindow):
         self.start_shortcut.setShortcut(QKeySequence("Ctrl+E"))
         self.start_shortcut.triggered.connect(self._on_start)
         self.addAction(self.start_shortcut)
+        # 放入资产库快捷键 Ctrl+Y（转换完成后待确认时生效）
+        self.add_asset_shortcut = QAction("放入资产库", self)
+        self.add_asset_shortcut.setShortcut(QKeySequence("Ctrl+Y"))
+        self.add_asset_shortcut.triggered.connect(self._on_add_asset_shortcut)
+        self.addAction(self.add_asset_shortcut)
 
         help_menu = menubar.addMenu("帮助")
         shortcuts_action = QAction("快捷键说明", self)
@@ -395,10 +439,16 @@ class MainWindow(QMainWindow):
         key = item.data(Qt.UserRole)
         self.param_panel.switch_to(key)
 
+        # 预览阶段：显示预览分页内容（单张/批量转换结果）
+        if key == "preview":
+            self._show_preview_current()
+            return
+
         # 无结果或该阶段结果缺失：显示原图
         if self.result is None or STAGE_TO_PIPELINE.get(key, key) not in self.result.stages:
             self._show_original()
             self._set_compare_visible(False)
+            self.preview_toolbar_widget.setVisible(False)
             return
 
         stages = self.result.stages
@@ -443,8 +493,8 @@ class MainWindow(QMainWindow):
             self.canvas.set_grid_overlay(None)
             self.canvas.set_info(f"调色板精炼 | {w}×{h} | {unique}色")
 
-        # 仅调色板精炼阶段提供"对比原图"功能
-        self._set_compare_visible(key == "palette_refine")
+        # 每个阶段都可对比原图
+        self._set_compare_visible(True)
         self.canvas.fit_to_view()
 
     def _set_compare_visible(self, visible: bool) -> None:
@@ -457,11 +507,137 @@ class MainWindow(QMainWindow):
         self.compare_btn.setVisible(visible)
         self.compare_btn.blockSignals(False)
 
+    # ------------------------------------------------------------------
+    # 预览阶段（单张/批量转换结果分页浏览、确认入库、重新生成）
+    # ------------------------------------------------------------------
+    def _preview_add_item(self, source_name: str, pixel_art, original) -> None:
+        """将转换结果加入预览列表。"""
+        self._preview_items.append((source_name, pixel_art, original))
+        # 若当前正停留在预览阶段，刷新显示（切到最新一张）
+        if (
+            self.stage_list.currentItem() is not None
+            and self.stage_list.currentItem().data(Qt.UserRole) == "preview"
+        ):
+            self._preview_index = len(self._preview_items) - 1
+            self._show_preview_current()
+
+    def _show_preview_current(self) -> None:
+        """显示当前预览张（画布 + 基础信息 + 分页状态）。"""
+        self.preview_toolbar_widget.setVisible(True)
+        # 进入预览时清除残留的对比勾选态
+        if self.compare_btn.isChecked():
+            self.compare_btn.blockSignals(True)
+            self.compare_btn.setChecked(False)
+            self.compare_btn.blockSignals(False)
+        if not self._preview_items:
+            self.canvas.clear()
+            self.canvas.set_info("暂无预览图片")
+            self.preview_page_label.setText("第 0 / 0 张")
+            self._set_compare_visible(False)
+            self._update_preview_buttons()
+            return
+        # 防止索引越界（删除后调整）
+        if self._preview_index >= len(self._preview_items):
+            self._preview_index = len(self._preview_items) - 1
+        if self._preview_index < 0:
+            self._preview_index = 0
+        name, art, _orig = self._preview_items[self._preview_index]
+        arr = np.clip(art, 0, 255).astype(np.uint8)
+        h, w = arr.shape[:2]
+        self.canvas.set_image(arr)
+        self.canvas.set_grid_overlay(None)
+        unique = len(np.unique(arr.reshape(-1, 3), axis=0))
+        self.canvas.set_info(f"{name} | {w}×{h} | {unique}色")
+        self.canvas.fit_to_view()
+        self.preview_page_label.setText(
+            f"第 {self._preview_index + 1} / {len(self._preview_items)} 张"
+        )
+        self._set_compare_visible(True)
+        self._update_preview_buttons()
+
+    def _update_preview_buttons(self) -> None:
+        has = bool(self._preview_items)
+        self.preview_prev_btn.setEnabled(has and self._preview_index > 0)
+        self.preview_next_btn.setEnabled(has and self._preview_index < len(self._preview_items) - 1)
+        for btn in (self.preview_regen_btn, self.preview_add_btn, self.preview_del_btn,
+                    self.preview_add_all_btn, self.preview_clear_btn):
+            btn.setEnabled(has)
+
+    def _preview_prev(self) -> None:
+        if self._preview_index > 0:
+            self._preview_index -= 1
+            self._show_preview_current()
+
+    def _preview_next(self) -> None:
+        if self._preview_index < len(self._preview_items) - 1:
+            self._preview_index += 1
+            self._show_preview_current()
+
+    def _preview_regen(self) -> None:
+        """使用当前参数重新生成当前预览张（可在参数面板调整后再点）。"""
+        if not self._preview_items:
+            return
+        name, _art, original = self._preview_items[self._preview_index]
+        try:
+            pipeline = Pipeline(self.params)
+            result = pipeline.run(original)
+        except Exception as e:
+            QMessageBox.warning(self, "重新生成失败", str(e))
+            return
+        self._preview_items[self._preview_index] = (name, result.pixel_art, original)
+        self.status_label.setText(f"已重新生成: {name}")
+        self._show_preview_current()
+
+    def _preview_add_current(self) -> None:
+        """将当前预览张加入资产库并从预览移除。"""
+        if not self._preview_items:
+            return
+        name, art, _orig = self._preview_items[self._preview_index]
+        self.asset_manager.add_asset(art, name)
+        self._preview_items.pop(self._preview_index)
+        self.status_label.setText(f"已加入资产库: {name}")
+        self._show_preview_current()
+
+    def _preview_delete_current(self) -> None:
+        """删除当前预览张。"""
+        if not self._preview_items:
+            return
+        name, _art, _orig = self._preview_items.pop(self._preview_index)
+        self.status_label.setText(f"已删除预览: {name}")
+        self._show_preview_current()
+
+    def _preview_add_all(self) -> None:
+        """一键将所有预览图片加入资产库并清空预览。"""
+        if not self._preview_items:
+            return
+        for name, art, _orig in list(self._preview_items):
+            self.asset_manager.add_asset(art, name)
+        count = len(self._preview_items)
+        self._preview_items.clear()
+        self._preview_index = 0
+        self.status_label.setText(f"已将 {count} 张预览图片加入资产库")
+        self._show_preview_current()
+
+    def _preview_clear_all(self) -> None:
+        """一键清空所有预览图片。"""
+        self._preview_items.clear()
+        self._preview_index = 0
+        self.status_label.setText("已清空预览")
+        self._show_preview_current()
+
     def _on_compare_toggled(self, checked: bool) -> None:
-        """对比原图开关：勾选时画布显示原图，取消时恢复当前阶段精炼结果。"""
+        """对比原图开关：勾选时画布显示原图，取消时恢复当前阶段/预览结果。"""
         if checked:
-            if self.image is not None:
-                self.canvas.set_image(self.image)
+            # 预览阶段对比当前张的原始图，其余阶段对比当前导入的原图
+            current_item = self.stage_list.currentItem()
+            key = current_item.data(Qt.UserRole) if current_item else None
+            target = None
+            if key == "preview" and self._preview_items:
+                target = self._preview_items[self._preview_index][2]
+            elif self.image is not None:
+                target = self.image
+            if target is not None:
+                self.canvas.set_image(np.clip(target, 0, 255).astype(np.uint8))
                 self.canvas.set_grid_overlay(None)
                 self.canvas.set_info("原图（对比）")
                 self.canvas.fit_to_view()
@@ -571,12 +747,18 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(self._on_error)
         self.worker.cancelled.connect(self._on_cancelled)
         self.worker.start()
+        self._conv_state = "running"
+        self.cancel_btn.setText("取消")
         self.start_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.progress_bar.setValue(0)
         self.status_label.setText("转换中...")
 
     def _on_cancel(self) -> None:
+        # 转换完成待入库状态：点击"放入资产库"触发入库
+        if self._conv_state == "done":
+            self._add_result_to_library()
+            return
         if self.worker is not None and self.worker.isRunning():
             self.worker.cancel()
         if (
@@ -592,11 +774,6 @@ class MainWindow(QMainWindow):
     def _on_finished(self, result: PipelineResult) -> None:
         self.result = result
         self._update_stage_list_status()
-        # 单图转换完成：将结果存入资产库
-        source_name = "未命名"
-        if hasattr(self, "_current_source_name"):
-            source_name = self._current_source_name
-        self.asset_manager.add_asset(result.pixel_art, source_name)
         meta = result.metadata
         self.canvas.set_image(result.pixel_art)
         self.canvas.set_grid_overlay(None)
@@ -608,18 +785,64 @@ class MainWindow(QMainWindow):
         self.status_label.setText("完成")
         self.progress_bar.setValue(100)
         self.start_btn.setEnabled(True)
+        # 转换结果加入"预览"阶段（单张与批量结果统一收集）
+        source_name = "未命名"
+        if hasattr(self, "_current_source_name"):
+            source_name = self._current_source_name
+        original = self.image if self.image is not None else result.pixel_art
+        self._preview_add_item(source_name, result.pixel_art, original)
+        # 是否自动移入资产库（设置项 auto_add_asset，默认关闭）
+        auto_add = config.load_preference("auto_add_asset", False)
+        if auto_add in (True, "true", "True", 1, "1"):
+            self._add_result_to_library(show_message=True)
+        else:
+            # 待用户确认：将"取消"按钮变为"放入资产库"
+            self._conv_state = "done"
+            self.cancel_btn.setText("放入资产库")
+            self.cancel_btn.setEnabled(True)
+        # 转换完成：显示"对比原图"按钮（所有阶段可对比），清除残留的对比勾选态，
+        # 保证重新转换后点击当前阶段即可对比，无需先切到其他阶段再切回
+        self.compare_btn.blockSignals(True)
+        self.compare_btn.setChecked(False)
+        self.compare_btn.blockSignals(False)
+        self._set_compare_visible(True)
+
+    def _add_result_to_library(self, show_message: bool = False) -> None:
+        """将当前转换结果加入资产库（手动"放入资产库"或自动移入时调用）。
+
+        入库后保留各阶段预览图片，方便继续对比查看。
+        """
+        if self.result is None:
+            return
+        source_name = "未命名"
+        if hasattr(self, "_current_source_name"):
+            source_name = self._current_source_name
+        self.asset_manager.add_asset(self.result.pixel_art, source_name)
+        # 复位按钮状态
+        self._conv_state = "idle"
+        self.cancel_btn.setText("取消")
         self.cancel_btn.setEnabled(False)
-        # 转换完成后重置对比按钮状态
-        self._set_compare_visible(False)
+        if show_message:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "已加入资产库", f"转换结果已保存到“我的资产”（{source_name}）")
+
+    def _on_add_asset_shortcut(self) -> None:
+        """Ctrl+Y：转换完成待确认时，将结果放入资产库。"""
+        if self._conv_state == "done" and self.result is not None:
+            self._add_result_to_library(show_message=True)
 
     def _on_error(self, msg: str) -> None:
         QMessageBox.warning(self, "错误", msg)
         self.status_label.setText("出错")
+        self._conv_state = "idle"
+        self.cancel_btn.setText("取消")
         self.start_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
 
     def _on_cancelled(self) -> None:
         self.status_label.setText("已取消")
+        self._conv_state = "idle"
+        self.cancel_btn.setText("取消")
         self.start_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
 
@@ -656,16 +879,23 @@ class MainWindow(QMainWindow):
         from .batch_worker import BatchWorker
         self._batch_worker = BatchWorker(folder, self.params, self.asset_manager)
         self._batch_worker.progress.connect(self._on_batch_progress)
-        self._batch_worker.image_done.connect(lambda _: None)  # 单张完成
+        self._batch_worker.image_done.connect(lambda _: None)  # 自动移入时单张完成
+        self._batch_worker.image_result.connect(self._on_batch_image_result)
         self._batch_worker.finished_all.connect(self._on_batch_finished)
         self._batch_worker.error.connect(self._on_batch_error)
         self._batch_worker.cancelled.connect(self._on_batch_cancelled)
         self._batch_worker.start()
+        self._conv_state = "batch_running"
+        self.cancel_btn.setText("取消")
         self.start_btn.setEnabled(False)
         self.batch_action.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.progress_bar.setValue(0)
         self.status_label.setText("批量处理中...")
+
+    def _on_batch_image_result(self, source_name: str, pixel_art, original) -> None:
+        """收集批量转换结果到"预览"阶段（无论是否自动移入）。"""
+        self._preview_add_item(source_name, pixel_art, original)
 
     def _on_batch_progress(self, current: int, total: int, filename: str) -> None:
         percent = int(current / total * 100) if total > 0 else 0
@@ -675,15 +905,22 @@ class MainWindow(QMainWindow):
     def _on_batch_finished(self, success: int) -> None:
         self.status_label.setText(f"批量完成: {success} 张成功")
         self.progress_bar.setValue(100)
+        self._conv_state = "idle"
+        self.cancel_btn.setText("取消")
         self.start_btn.setEnabled(True)
         self.batch_action.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+        # 批量结果已收集到"预览"阶段（分页浏览确认），提示用户前往查看
+        if self._preview_items:
+            self.status_label.setText(f"批量完成: {success} 张成功，结果已放入“预览”阶段")
 
     def _on_batch_error(self, filename: str, msg: str) -> None:
         self.status_label.setText(f"错误: {filename} - {msg}")
 
     def _on_batch_cancelled(self) -> None:
         self.status_label.setText("批量处理已取消")
+        self._conv_state = "idle"
+        self.cancel_btn.setText("取消")
         self.start_btn.setEnabled(True)
         self.batch_action.setEnabled(True)
         self.cancel_btn.setEnabled(False)
@@ -719,8 +956,13 @@ class MainWindow(QMainWindow):
 def main() -> int:
     """启动 GUI 应用。"""
     from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import QCoreApplication
 
     app = QApplication.instance() or QApplication(sys.argv)
+    # 设置组织/应用名，使无参 QSettings() 能定位到持久化存储
+    # （此前未设置导致参数/偏好写入被静默丢弃，重启后回默认值）
+    QCoreApplication.setOrganizationName("AIPixelTool")
+    QCoreApplication.setApplicationName("AIPixelImageConversionTool")
     window = MainWindow()
     window.show()
     return app.exec()

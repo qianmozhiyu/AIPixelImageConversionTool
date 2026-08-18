@@ -6,10 +6,10 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QPoint, QRect
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QScrollArea,
-    QGridLayout, QFrame, QLineEdit,
+    QGridLayout, QFrame, QLineEdit, QRubberBand,
 )
 
 import numpy as np
@@ -30,11 +30,18 @@ class AssetCard(QFrame):
     edit_requested = Signal(str)  # asset_id（悬停"编辑"按钮）
     download_requested = Signal(str)  # asset_id
     delete_requested = Signal(str)    # asset_id
+    # 框选拖拽信号（全局坐标）：从卡片上按下拖拽时，卡片将事件转发给页面
+    drag_started = Signal(QPoint)
+    drag_moved = Signal(QPoint)
+    drag_ended = Signal(QPoint)
 
     def __init__(self, asset_info, parent=None):
         super().__init__(parent)
         self.asset_info = asset_info
         self._selected = False
+        self._press_global = None
+        self._dragging = False
+        self.setMouseTracking(True)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -147,7 +154,32 @@ class AssetCard(QFrame):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self.asset_info.id)
+            # 记录按下位置，拖拽超过阈值时转为框选；未拖拽则 release 时触发选中
+            self._press_global = event.globalPosition().toPoint()
+            self._dragging = False
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._press_global is None:
+            return
+        if not self._dragging:
+            # 拖拽距离阈值：超过 6px 判定为框选开始
+            local = self.mapFromGlobal(self._press_global)
+            if (event.position().toPoint() - local).manhattanLength() > 6:
+                self._dragging = True
+                self.drag_started.emit(self._press_global)
+        if self._dragging:
+            self.drag_moved.emit(event.globalPosition().toPoint())
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._dragging:
+                self.drag_ended.emit(event.globalPosition().toPoint())
+            else:
+                self.clicked.emit(self.asset_info.id)
+            self._press_global = None
+            self._dragging = False
+            event.accept()
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -243,6 +275,14 @@ class AssetsPage(QWidget):
         self.scroll.setWidget(self.grid_container)
         layout.addWidget(self.scroll, 1)
 
+        # 框选（rubber band）：空白区拖拽 + 从卡片上拖拽均支持
+        self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self.scroll.viewport())
+        self._rubber_origin: QPoint | None = None
+        self.grid_container.setMouseTracking(True)
+        self.scroll.viewport().setMouseTracking(True)
+        self.grid_container.installEventFilter(self)
+        self.scroll.viewport().installEventFilter(self)
+
         # 空状态提示
         self.empty_label = QLabel("暂无资产，请先转换图片")
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -283,10 +323,74 @@ class AssetsPage(QWidget):
             card.edit_requested.connect(self._on_card_double_clicked)
             card.download_requested.connect(self._on_download_single)
             card.delete_requested.connect(self._on_delete_single)
+            card.drag_started.connect(self._on_card_drag_started)
+            card.drag_moved.connect(self._on_card_drag_moved)
+            card.drag_ended.connect(self._on_card_drag_ended)
             self.grid_layout.addWidget(card, i // cols, i % cols)
             self._cards.append(card)
 
         self._update_toolbar_state()
+
+    # ------------------------------------------------------------------
+    # 框选（rubber band）
+    # ------------------------------------------------------------------
+    def eventFilter(self, obj, event):
+        """网格容器/滚动视口上的空白区拖拽框选。"""
+        t = event.type()
+        if obj in (self.grid_container, self.scroll.viewport()):
+            if t == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._start_rubber(self._to_viewport(obj, event.position().toPoint()))
+                return True
+            if t == QEvent.Type.MouseMove and self._rubber_origin is not None:
+                self._update_rubber(self._to_viewport(obj, event.position().toPoint()))
+                return True
+            if t == QEvent.Type.MouseButtonRelease and self._rubber_origin is not None:
+                self._finish_rubber(self._to_viewport(obj, event.position().toPoint()))
+                return True
+        return super().eventFilter(obj, event)
+
+    def _to_viewport(self, obj, local_pos: QPoint) -> QPoint:
+        """将 obj 坐标系中的点映射到滚动视口坐标系。"""
+        return obj.mapTo(self.scroll.viewport(), local_pos)
+
+    def _on_card_drag_started(self, global_pos: QPoint) -> None:
+        self._start_rubber(self.scroll.viewport().mapFromGlobal(global_pos))
+
+    def _on_card_drag_moved(self, global_pos: QPoint) -> None:
+        self._update_rubber(self.scroll.viewport().mapFromGlobal(global_pos))
+
+    def _on_card_drag_ended(self, global_pos: QPoint) -> None:
+        self._finish_rubber(self.scroll.viewport().mapFromGlobal(global_pos))
+
+    def _start_rubber(self, pos: QPoint) -> None:
+        self._rubber_origin = pos
+        self._rubber.setGeometry(QRect(pos, pos))
+        self._rubber.show()
+
+    def _update_rubber(self, pos: QPoint) -> None:
+        if self._rubber_origin is None:
+            return
+        self._rubber.setGeometry(QRect(self._rubber_origin, pos).normalized())
+
+    def _finish_rubber(self, pos: QPoint) -> None:
+        if self._rubber_origin is None:
+            return
+        rect = QRect(self._rubber_origin, pos).normalized()
+        self._rubber_origin = None
+        self._rubber.hide()
+        # 与矩形相交的卡片加入选中（框选替换当前选择）
+        vp = self.scroll.viewport()
+        new_selected = set()
+        for card in self._cards:
+            tl = self.grid_container.mapTo(vp, card.geometry().topLeft())
+            card_rect = QRect(tl, card.size())
+            if rect.intersects(card_rect):
+                new_selected.add(card.asset_info.id)
+        if new_selected:
+            self._selected_ids = new_selected
+            for card in self._cards:
+                card.set_selected(card.asset_info.id in self._selected_ids)
+            self._update_toolbar_state()
 
     def _on_card_clicked(self, asset_id: str) -> None:
         """单击切换选中状态。"""
@@ -308,7 +412,7 @@ class AssetsPage(QWidget):
         self.btn_delete.setEnabled(has_selection)
 
     def _on_batch_export(self) -> None:
-        """批量导出选中资产。"""
+        """批量导出选中资产；若开启"下载后移出"则导出后删除资产。"""
         from PySide6.QtWidgets import QFileDialog, QMessageBox
         if not self._selected_ids:
             return
@@ -316,13 +420,22 @@ class AssetsPage(QWidget):
         dest_dir = QFileDialog.getExistingDirectory(self, "选择导出文件夹", default_dir)
         if not dest_dir:
             return
+        removes = load_preference("download_removes_asset", True)
         count = 0
-        for asset_id in self._selected_ids:
+        removed = False
+        # 遍历用 list() 拷贝：删除资产时避免迭代 set 导致 RuntimeError
+        for asset_id in list(self._selected_ids):
             info = self.asset_manager.get_info(asset_id)
             if info:
                 dest = f"{dest_dir}/{info.source_name}.png"
                 if self.asset_manager.export_asset(asset_id, dest):
                     count += 1
+                    if removes in (True, "true", "True", 1, "1"):
+                        self.asset_manager.delete_asset(asset_id)
+                        removed = True
+        if removed:
+            # refresh() 会清空 _selected_ids，须在循环结束后统一刷新
+            self.refresh()
         QMessageBox.information(self, "导出完成", f"已导出 {count} 个资产到 {dest_dir}")
 
     def _on_batch_delete(self) -> None:

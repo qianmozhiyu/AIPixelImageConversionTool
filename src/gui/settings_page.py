@@ -41,6 +41,11 @@ class SettingsPage(QWidget):
         self.cb_download_removes.stateChanged.connect(self._on_changed)
         asset_layout.addRow(self.cb_download_removes)
 
+        self.cb_auto_add = QCheckBox('转换后自动移入“我的资产”')
+        self.cb_auto_add.setToolTip("关闭时：转换完成后需点击“放入资产库”才会保存到资产库")
+        self.cb_auto_add.stateChanged.connect(self._on_changed_auto_add)
+        asset_layout.addRow(self.cb_auto_add)
+
         self.le_output_dir = QLineEdit()
         self.le_output_dir.setReadOnly(True)
         self.btn_output_dir = QPushButton("选择...")
@@ -85,6 +90,10 @@ class SettingsPage(QWidget):
             config.load_preference("download_removes_asset", True) is True or
             config.load_preference("download_removes_asset", True) in ("true", "True", 1, "1")
         )
+        auto_add = config.load_preference("auto_add_asset", False)
+        self.cb_auto_add.setChecked(
+            auto_add is True or auto_add in ("true", "True", 1, "1")
+        )
         self.le_output_dir.setText(config.load_preference("default_output_dir", "") or "")
         asset_dir = config.load_preference("asset_store_dir", "") or ""
         if not asset_dir:
@@ -97,6 +106,10 @@ class SettingsPage(QWidget):
 
     def _on_changed(self) -> None:
         config.save_preference("download_removes_asset", self.cb_download_removes.isChecked())
+        self.settings_changed.emit()
+
+    def _on_changed_auto_add(self) -> None:
+        config.save_preference("auto_add_asset", self.cb_auto_add.isChecked())
         self.settings_changed.emit()
 
     def _on_undo_limit_changed(self, value: int) -> None:

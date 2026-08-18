@@ -1935,12 +1935,13 @@ def expand_grid_edge_guided(
     h_logic = max_gy - min_gy + 1
 
     if not placed:
+        # 等距兜底网格：直接用浮点周期，避免取整导致的累积漂移
         cell_ys = np.broadcast_to(
-            ((np.arange(h_logic + 1, dtype=np.float64) + min_gy) * py_i)[:, None],
+            ((np.arange(h_logic + 1, dtype=np.float64) + min_gy) * py)[:, None],
             (h_logic + 1, w_logic + 1),
         ).copy()
         cell_xs = np.broadcast_to(
-            ((np.arange(w_logic + 1, dtype=np.float64) + min_gx) * px_i)[None, :],
+            ((np.arange(w_logic + 1, dtype=np.float64) + min_gx) * px)[None, :],
             (h_logic + 1, w_logic + 1),
         ).copy()
         return (cell_ys, cell_xs)

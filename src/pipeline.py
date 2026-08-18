@@ -99,7 +99,7 @@ class PipelineParams:
     # 放大与锐化
     enable_upscale: bool = False               # 降噪后是否双线性放大
     upscale_factor: int = 2                    # 放大倍数
-    upscale_method: str = "nearest"           # 放大算法："nearest"/"bilinear"/"bicubic"/"lanczos"
+    upscale_method: str = "bilinear"          # 放大算法："nearest"/"bilinear"/"bicubic"/"lanczos"
     enable_sharpen: bool = False               # 是否启用 unsharp mask 锐化（默认关闭）
     sharpen_strength: float = 0.5              # 锐化强度 0.0-1.0
     # 网格检测
@@ -113,7 +113,7 @@ class PipelineParams:
     smooth_strength: float = 0.5            # 全局平滑约束强度（0.0-1.0）
     outlier_reject_ratio: float = 0.5             # 网格检测离群间距剔除阈值比例
     # 块提取
-    extract_method: str = "median"              # "median"/"mean"/"mode"/"kmeans"
+    extract_method: str = "kmeans"              # "median"/"mean"/"mode"/"kmeans"
     extract_core_ratio: float = 0.6            # 0.5-1.0
     # 正方形修正
     fix_square: bool = False

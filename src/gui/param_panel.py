@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QObject
+from PySide6.QtCore import Qt, Signal, QObject, QEvent
 from PySide6.QtWidgets import (
     QWidget,
     QSlider,
@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QVBoxLayout,
-    QStackedWidget,
+    QFrame,
+    QScrollArea,
 )
 
 from ..pipeline import PipelineParams
@@ -68,16 +69,27 @@ class _LabeledSlider(QWidget):
 
 
 class _StagePage(QWidget):
-    """阶段参数页基类。
+    """阶段参数区块基类。
 
     子类实现 :meth:`sync_from_params` 从参数同步控件，并在控件变更时通过
     :meth:`_emit_changed` 让面板发出 ``param_changed`` 信号。
+    面板将所有阶段区块垂直堆叠（单滚动面板），区块间由分隔线隔开。
     """
 
-    def __init__(self, panel: "ParamPanel", stage_name: str, parent=None):
+    def __init__(self, panel: "ParamPanel", stage_name: str, title_text: str, parent=None):
         super().__init__(parent)
         self._panel = panel
         self._stage_name = stage_name
+        self._vbox = QVBoxLayout(self)
+        self._vbox.setContentsMargins(0, 0, 0, 0)
+        self._vbox.setSpacing(8)
+        title = QLabel(title_text)
+        title.setStyleSheet(
+            "font-weight: bold; color: #e0e0e0; font-size: 15px; padding: 6px 0 2px 0;"
+        )
+        self._vbox.addWidget(title)
+        self.form = QFormLayout()
+        self._vbox.addLayout(self.form)
 
     @property
     def _params(self) -> PipelineParams:
@@ -94,11 +106,7 @@ class _DenoisePage(_StagePage):
     """AI 降噪阶段页。"""
 
     def __init__(self, panel, stage_name, parent=None):
-        super().__init__(panel, stage_name, parent)
-        form = QFormLayout(self)
-        title = QLabel("AI 降噪设置")
-        title.setStyleSheet("font-weight: bold; color: #e0e0e0; font-size: 14px; padding: 4px 0;")
-        form.addRow(title)
+        super().__init__(panel, stage_name, "AI 降噪")
         self.method = QComboBox()
         self.method.addItem("不降噪", "none")
         self.method.addItem("NL-Means", "nl_means")
@@ -112,10 +120,10 @@ class _DenoisePage(_StagePage):
         self.clahe_clip_limit.setSingleStep(0.01)
         self.clahe_clip_limit.setDecimals(2)
         self.clahe_clip_limit.setValue(0.03)
-        form.addRow("降噪方法", self.method)
-        form.addRow("降噪强度", self.strength)
-        form.addRow(self.enable_clahe)
-        form.addRow("CLAHE 裁剪限制", self.clahe_clip_limit)
+        self.form.addRow("降噪方法", self.method)
+        self.form.addRow("降噪强度", self.strength)
+        self.form.addRow(self.enable_clahe)
+        self.form.addRow("CLAHE 裁剪限制", self.clahe_clip_limit)
         self.method.currentIndexChanged.connect(self._on_changed)
         self.strength.valueChanged().connect(self._on_changed)
         self.enable_clahe.stateChanged.connect(self._on_changed)
@@ -152,11 +160,7 @@ class _UpscalePage(_StagePage):
     """放大阶段页。"""
 
     def __init__(self, panel, stage_name, parent=None):
-        super().__init__(panel, stage_name, parent)
-        form = QFormLayout(self)
-        title = QLabel("放大与锐化设置")
-        title.setStyleSheet("font-weight: bold; color: #e0e0e0; font-size: 14px; padding: 4px 0;")
-        form.addRow(title)
+        super().__init__(panel, stage_name, "放大")
         self.enable = QCheckBox("启用放大（提升网格检测分辨率）")
         self.enable.setChecked(False)
         self.upscale_method = QComboBox()
@@ -167,18 +171,18 @@ class _UpscalePage(_StagePage):
         self.upscale_factor = QSpinBox()
         self.upscale_factor.setRange(2, 4)
         self.upscale_factor.setValue(2)
-        self.enable_sharpen = QCheckBox("启用锐化（unsharp mask）")
+        self.enable_sharpen = QCheckBox("启用锐化（unsharp mask）（需开启放大）")
         self.enable_sharpen.setChecked(False)
         self.sharpen_strength = QDoubleSpinBox()
         self.sharpen_strength.setRange(0.0, 1.0)
         self.sharpen_strength.setSingleStep(0.1)
         self.sharpen_strength.setDecimals(1)
         self.sharpen_strength.setValue(0.5)
-        form.addRow(self.enable)
-        form.addRow("放大算法", self.upscale_method)
-        form.addRow("放大倍数", self.upscale_factor)
-        form.addRow(self.enable_sharpen)
-        form.addRow("锐化强度", self.sharpen_strength)
+        self.form.addRow(self.enable)
+        self.form.addRow("放大算法", self.upscale_method)
+        self.form.addRow("放大倍数", self.upscale_factor)
+        self.form.addRow(self.enable_sharpen)
+        self.form.addRow("锐化强度", self.sharpen_strength)
         self.enable.stateChanged.connect(self._on_changed)
         self.upscale_method.currentIndexChanged.connect(self._on_changed)
         self.upscale_factor.valueChanged.connect(self._on_changed)
@@ -228,16 +232,12 @@ class _PaletteRefinePage(_StagePage):
     """调色板精炼阶段页。"""
 
     def __init__(self, panel, stage_name, parent=None):
-        super().__init__(panel, stage_name, parent)
-        form = QFormLayout(self)
-        title = QLabel("调色板精炼设置")
-        title.setStyleSheet("font-weight: bold; color: #e0e0e0; font-size: 14px; padding: 4px 0;")
-        form.addRow(title)
+        super().__init__(panel, stage_name, "调色板精炼")
         self.enable = QCheckBox("启用 K-means 调色板精炼（统一全局色彩）")
         self.enable.setChecked(True)
         self.colors = _LabeledSlider(2, 64, scale=1, suffix=" 色")
-        form.addRow(self.enable)
-        form.addRow("颜色数", self.colors)
+        self.form.addRow(self.enable)
+        self.form.addRow("颜色数", self.colors)
         self.enable.stateChanged.connect(self._on_changed)
         self.colors.valueChanged().connect(self._on_changed)
 
@@ -258,11 +258,7 @@ class _GridDetectPage(_StagePage):
     """网格检测阶段页。"""
 
     def __init__(self, panel, stage_name, parent=None):
-        super().__init__(panel, stage_name, parent)
-        form = QFormLayout(self)
-        title = QLabel("网格检测设置")
-        title.setStyleSheet("font-weight: bold; color: #e0e0e0; font-size: 14px; padding: 4px 0;")
-        form.addRow(title)
+        super().__init__(panel, stage_name, "网格检测")
         self.min_p = QSpinBox()
         self.min_p.setRange(2, 100)
         self.max_p = QSpinBox()
@@ -272,31 +268,31 @@ class _GridDetectPage(_StagePage):
         self.snr_threshold.setSingleStep(0.5)
         self.snr_threshold.setDecimals(1)
         self.snr_threshold.setValue(8.0)
-        form.addRow("最小周期 min_p", self.min_p)
-        form.addRow("最大周期 max_p", self.max_p)
-        form.addRow("SNR 阈值", self.snr_threshold)
+        self.form.addRow("最小周期 min_p", self.min_p)
+        self.form.addRow("最大周期 max_p", self.max_p)
+        self.form.addRow("SNR 阈值", self.snr_threshold)
         self.edge_tol = QSpinBox()
         self.edge_tol.setRange(1, 10)
         self.edge_tol.setValue(3)
-        form.addRow("边缘搜索容差", self.edge_tol)
+        self.form.addRow("边缘搜索容差", self.edge_tol)
         self.subpixel_refine = QCheckBox("启用亚像素精炼")
         self.subpixel_refine.setChecked(True)
-        form.addRow(self.subpixel_refine)
+        self.form.addRow(self.subpixel_refine)
         self.smooth_strength = QDoubleSpinBox()
         self.smooth_strength.setRange(0.0, 1.0)
         self.smooth_strength.setSingleStep(0.1)
         self.smooth_strength.setDecimals(1)
         self.smooth_strength.setValue(0.5)
-        form.addRow("平滑强度", self.smooth_strength)
+        self.form.addRow("平滑强度", self.smooth_strength)
         self.outlier_reject_ratio = QDoubleSpinBox()
         self.outlier_reject_ratio.setRange(0.0, 1.0)
         self.outlier_reject_ratio.setSingleStep(0.1)
         self.outlier_reject_ratio.setDecimals(1)
         self.outlier_reject_ratio.setValue(0.5)
-        form.addRow("离群剔除比例", self.outlier_reject_ratio)
+        self.form.addRow("离群剔除比例", self.outlier_reject_ratio)
         self.fix_square = QCheckBox("正方形修正（差1时自动修正为正方形）")
         self.fix_square.setChecked(False)
-        form.addRow(self.fix_square)
+        self.form.addRow(self.fix_square)
         self.min_p.valueChanged.connect(self._on_changed)
         self.max_p.valueChanged.connect(self._on_changed)
         self.snr_threshold.valueChanged.connect(self._on_changed)
@@ -349,19 +345,15 @@ class _ExtractPage(_StagePage):
     """块提取阶段页。"""
 
     def __init__(self, panel, stage_name, parent=None):
-        super().__init__(panel, stage_name, parent)
-        form = QFormLayout(self)
-        title = QLabel("块提取设置")
-        title.setStyleSheet("font-weight: bold; color: #e0e0e0; font-size: 14px; padding: 4px 0;")
-        form.addRow(title)
+        super().__init__(panel, stage_name, "块提取")
         self.method = QComboBox()
         self.method.addItem("中位数 (median)", "median")
         self.method.addItem("均值 (mean)", "mean")
         self.method.addItem("众数 (mode)", "mode")
         self.method.addItem("K-means (kmeans)", "kmeans")
         self.core_ratio = _LabeledSlider(0.5, 1.0, scale=100)
-        form.addRow("代表色算法", self.method)
-        form.addRow("核心区比例", self.core_ratio)
+        self.form.addRow("代表色算法", self.method)
+        self.form.addRow("核心区比例", self.core_ratio)
         self.method.currentIndexChanged.connect(self._on_changed)
         self.core_ratio.valueChanged().connect(self._on_changed)
 
@@ -466,16 +458,71 @@ class ParamPanel(QWidget):
         """)
         layout = QVBoxLayout(self)
 
-        self._stack = QStackedWidget()
-        layout.addWidget(self._stack)
+        # 单滚动面板：所有阶段参数垂直排列，阶段间用线段分隔
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+            # 滚动条：窄（8px）、深色背景、主题蓝 handle
+            "QScrollArea QScrollBar:vertical { background: #2d2d2d; width: 8px;"
+            "  border-radius: 4px; margin: 2px; }"
+            "QScrollArea QScrollBar::handle:vertical { background: #4a9eff;"
+            "  border-radius: 4px; min-height: 32px; }"
+            "QScrollArea QScrollBar::handle:vertical:hover { background: #5fb0ff; }"
+            "QScrollArea QScrollBar::add-line:vertical,"
+            "QScrollArea QScrollBar::sub-line:vertical { height: 0; }"
+            "QScrollArea QScrollBar::add-page:vertical,"
+            "QScrollArea QScrollBar::sub-page:vertical { background: transparent; }"
+        )
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(8, 8, 8, 8)
+        content_layout.setSpacing(0)
         self._pages: dict[str, _StagePage] = {}
         self._order: list[str] = []
-        for key, _label in self.STAGES:
+        for idx, (key, _label) in enumerate(self.STAGES):
             page = self._make_page(key)
             self._pages[key] = page
             self._order.append(key)
-            self._stack.addWidget(page)
+            content_layout.addWidget(page)
+            if idx < len(self.STAGES) - 1:
+                # 阶段间线段分隔（加粗、左右留边居中）
+                line_wrap = QHBoxLayout()
+                line_wrap.setContentsMargins(4, 10, 4, 10)
+                line = QFrame()
+                line.setFixedHeight(2)
+                line.setStyleSheet(
+                    "background: #5a5a68; border: none; border-radius: 1px;"
+                )
+                line_wrap.addWidget(line)
+                content_layout.addLayout(line_wrap)
+        content_layout.addStretch(1)
+        self._scroll.setWidget(content)
+        layout.addWidget(self._scroll)
+        # 禁用鼠标滚轮调整参数（滚轮改为滚动参数面板）
+        self._install_wheel_filter()
         self.sync_from_params()
+
+    def _install_wheel_filter(self) -> None:
+        """对下拉框/数字框/滑杆安装滚轮过滤：滚轮不调整参数值，改为滚动面板。"""
+        from PySide6.QtWidgets import QSlider
+        targets = []
+        for cls in (QComboBox, QSpinBox, QDoubleSpinBox, QSlider):
+            targets.extend(self.findChildren(cls))
+        for w in targets:
+            w.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.Wheel:
+            # 滚轮事件转发给面板滚动条（等效于在空白处滚动）
+            delta = event.angleDelta().y()
+            if delta:
+                sb = self._scroll.verticalScrollBar()
+                sb.setValue(sb.value() - delta)
+            return True
+        return super().eventFilter(obj, event)
 
     def sync_from_params(self) -> None:
         """从参数同步各阶段页。"""
@@ -492,10 +539,19 @@ class ParamPanel(QWidget):
         }
         return makers[key](self, key)
 
+    def set_params(self, params: PipelineParams) -> None:
+        """替换内部持有的参数对象引用并同步控件。
+
+        主窗口在"恢复默认参数"或设置变更时调用：重新加载的 params 是新对象，
+        必须更新此引用，否则 sync_from_params 会从旧对象同步（表现为无效果）。
+        """
+        self._params = params
+        self.sync_from_params()
+
     def switch_to(self, stage: str) -> None:
-        """切换到指定阶段页面并从参数同步控件。"""
+        """滚动到指定阶段参数区并同步控件（单面板内全部阶段可见）。"""
         if stage not in self._pages:
             return
-        idx = self._order.index(stage)
-        self._stack.setCurrentIndex(idx)
-        self._pages[stage].sync_from_params()
+        page = self._pages[stage]
+        page.sync_from_params()
+        self._scroll.ensureWidgetVisible(page, 0, 0)
