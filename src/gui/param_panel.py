@@ -1,6 +1,6 @@
 """参数面板组件。
 
-按流水线阶段组织参数编辑界面，使用 QStackedWidget 在降噪、放大、
+按流水线阶段组织参数编辑界面，使用 QStackedWidget 在降噪、调整大小、
 网格检测、块提取、调色板精炼五个阶段页面间切换；控件变更时回写
 :class:`PipelineParams` 并发出 ``param_changed`` 信号通知主窗口。
 """
@@ -120,14 +120,22 @@ class _DenoisePage(_StagePage):
         self.clahe_clip_limit.setSingleStep(0.01)
         self.clahe_clip_limit.setDecimals(2)
         self.clahe_clip_limit.setValue(0.03)
+        self.enable_aa_removal = QCheckBox("抗锯齿消除（清理块边界/网格线 AA 杂色）")
+        self.enable_aa_removal.setChecked(False)
+        self.denoise_grid_guard = QCheckBox("去噪网格保护（去噪过强时自动减半强度重去噪）")
+        self.denoise_grid_guard.setChecked(False)
         self.form.addRow("降噪方法", self.method)
         self.form.addRow("降噪强度", self.strength)
         self.form.addRow(self.enable_clahe)
         self.form.addRow("CLAHE 裁剪限制", self.clahe_clip_limit)
+        self.form.addRow(self.enable_aa_removal)
+        self.form.addRow(self.denoise_grid_guard)
         self.method.currentIndexChanged.connect(self._on_changed)
         self.strength.valueChanged().connect(self._on_changed)
         self.enable_clahe.stateChanged.connect(self._on_changed)
         self.clahe_clip_limit.valueChanged.connect(self._on_changed)
+        self.enable_aa_removal.stateChanged.connect(self._on_changed)
+        self.denoise_grid_guard.stateChanged.connect(self._on_changed)
 
     def _on_changed(self, *args) -> None:
         data = self.method.currentData()
@@ -136,6 +144,8 @@ class _DenoisePage(_StagePage):
         self._params.ai_denoise_strength = self.strength.value()
         self._params.enable_clahe = self.enable_clahe.isChecked()
         self._params.clahe_clip_limit = self.clahe_clip_limit.value()
+        self._params.enable_aa_removal = self.enable_aa_removal.isChecked()
+        self._params.denoise_grid_guard = self.denoise_grid_guard.isChecked()
         self._emit_changed()
         self.clahe_clip_limit.setEnabled(self.enable_clahe.isChecked())
 
@@ -145,22 +155,28 @@ class _DenoisePage(_StagePage):
         self.method.blockSignals(True)
         self.enable_clahe.blockSignals(True)
         self.clahe_clip_limit.blockSignals(True)
+        self.enable_aa_removal.blockSignals(True)
+        self.denoise_grid_guard.blockSignals(True)
         idx = self.method.findData(method)
         self.method.setCurrentIndex(idx if idx >= 0 else 0)
         self.enable_clahe.setChecked(p.enable_clahe)
         self.clahe_clip_limit.setValue(p.clahe_clip_limit)
+        self.enable_aa_removal.setChecked(p.enable_aa_removal)
+        self.denoise_grid_guard.setChecked(p.denoise_grid_guard)
         self.method.blockSignals(False)
         self.enable_clahe.blockSignals(False)
         self.clahe_clip_limit.blockSignals(False)
+        self.enable_aa_removal.blockSignals(False)
+        self.denoise_grid_guard.blockSignals(False)
         self.strength.set_value(p.ai_denoise_strength)
         self.clahe_clip_limit.setEnabled(self.enable_clahe.isChecked())
 
 
-class _UpscalePage(_StagePage):
-    """放大阶段页。"""
+class _ResizePage(_StagePage):
+    """调整大小阶段页。"""
 
     def __init__(self, panel, stage_name, parent=None):
-        super().__init__(panel, stage_name, "放大")
+        super().__init__(panel, stage_name, "调整大小")
         self.enable = QCheckBox("启用放大（提升网格检测分辨率）")
         self.enable.setChecked(False)
         self.upscale_method = QComboBox()
@@ -293,6 +309,9 @@ class _GridDetectPage(_StagePage):
         self.fix_square = QCheckBox("正方形修正（差1时自动修正为正方形）")
         self.fix_square.setChecked(False)
         self.form.addRow(self.fix_square)
+        self.enable_pre_quantize = QCheckBox("检测前预量化（小调色板量化提升低对比度边缘可检测性）")
+        self.enable_pre_quantize.setChecked(False)
+        self.form.addRow(self.enable_pre_quantize)
         self.min_p.valueChanged.connect(self._on_changed)
         self.max_p.valueChanged.connect(self._on_changed)
         self.snr_threshold.valueChanged.connect(self._on_changed)
@@ -301,6 +320,7 @@ class _GridDetectPage(_StagePage):
         self.smooth_strength.valueChanged.connect(self._on_changed)
         self.outlier_reject_ratio.valueChanged.connect(self._on_changed)
         self.fix_square.stateChanged.connect(self._on_changed)
+        self.enable_pre_quantize.stateChanged.connect(self._on_changed)
 
     def _on_changed(self, *args) -> None:
         self._params.min_p = self.min_p.value()
@@ -311,6 +331,7 @@ class _GridDetectPage(_StagePage):
         self._params.smooth_strength = self.smooth_strength.value()
         self._params.outlier_reject_ratio = self.outlier_reject_ratio.value()
         self._params.fix_square = self.fix_square.isChecked()
+        self._params.enable_pre_quantize = self.enable_pre_quantize.isChecked()
         self._emit_changed()
 
     def sync_from_params(self) -> None:
@@ -323,6 +344,7 @@ class _GridDetectPage(_StagePage):
         self.smooth_strength.blockSignals(True)
         self.outlier_reject_ratio.blockSignals(True)
         self.fix_square.blockSignals(True)
+        self.enable_pre_quantize.blockSignals(True)
         self.min_p.setValue(p.min_p)
         self.max_p.setValue(p.max_p)
         self.snr_threshold.setValue(p.snr_threshold)
@@ -331,6 +353,7 @@ class _GridDetectPage(_StagePage):
         self.smooth_strength.setValue(p.smooth_strength)
         self.outlier_reject_ratio.setValue(p.outlier_reject_ratio)
         self.fix_square.setChecked(p.fix_square)
+        self.enable_pre_quantize.setChecked(p.enable_pre_quantize)
         self.min_p.blockSignals(False)
         self.max_p.blockSignals(False)
         self.snr_threshold.blockSignals(False)
@@ -339,6 +362,7 @@ class _GridDetectPage(_StagePage):
         self.smooth_strength.blockSignals(False)
         self.outlier_reject_ratio.blockSignals(False)
         self.fix_square.blockSignals(False)
+        self.enable_pre_quantize.blockSignals(False)
 
 
 class _ExtractPage(_StagePage):
@@ -348,6 +372,7 @@ class _ExtractPage(_StagePage):
         super().__init__(panel, stage_name, "块提取")
         self.method = QComboBox()
         self.method.addItem("中位数 (median)", "median")
+        self.method.addItem("主色 (dominant)", "dominant")
         self.method.addItem("均值 (mean)", "mean")
         self.method.addItem("众数 (mode)", "mode")
         self.method.addItem("K-means (kmeans)", "kmeans")
@@ -381,7 +406,7 @@ class ParamPanel(QWidget):
 
     STAGES = [
         ("denoise", "AI 降噪"),
-        ("upscale", "放大"),
+        ("resize", "调整大小"),
         ("grid_detect", "网格检测"),
         ("extract", "块提取"),
         ("palette_refine", "调色板精炼"),
@@ -532,7 +557,7 @@ class ParamPanel(QWidget):
     def _make_page(self, key: str) -> _StagePage:
         makers = {
             "denoise": _DenoisePage,
-            "upscale": _UpscalePage,
+            "resize": _ResizePage,
             "grid_detect": _GridDetectPage,
             "extract": _ExtractPage,
             "palette_refine": _PaletteRefinePage,

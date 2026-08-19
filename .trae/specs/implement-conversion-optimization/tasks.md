@@ -1,0 +1,43 @@
+# Tasks
+- [x] Task 1: G7 一致性修复（低风险基建，先行）
+  - [x] SubTask 1.1: F1 投影信号去重——detect() 统一计算 sig_x/sig_y，重构 has_pixel_grid 接受预计算信号（行为不变，消除重复 O(H·W)）
+  - [x] SubTask 1.2: C4 FFT 分数修正——_vote_period 中候选的 fft 分数改为候选周期处谱幅值（谐波频率线性插值 + 带内归一化），删除"距主峰距离"近似
+  - [x] SubTask 1.3: C5 浮点周期修复——expand_grid_edge_guided 邻居扩展偏移（nx1/ny1 = 起点 + 浮点 px/py）与理想外推（gx * px 而非 gx * px_i）
+  - [x] SubTask 1.4: R1 低置信标记——Grid 新增 low_confidence 字段（conf<0.4），PipelineResult.metadata 透出
+  - [x] SubTask 1.5: 全量 pytest 验证零回归（379 通过；2 个失败为存量 GUI 问题，git stash 验证与本次无关；image02 detect 耗时 3.07→2.18s）
+- [x] Task 2: G1 OKLAB 色差检测信号
+  - [x] SubTask 2.1: 新增色差信号原语——OKLAB 相邻像素差分图（向量化，复用 color.rgb_to_oklab）、色差投影剖面、色差 edge_map（局部对比度归一化复用现有实现）
+  - [x] SubTask 2.2: detect() 支持 signal="oklab"（接受 RGB 3D 输入；gray 2D 输入路径不变）；find_phase 色差模式（基于 edge_map 边界带能量的相位评分，实现为 find_phase_edge 条带强度和 + 峰中比 conf）
+  - [x] SubTask 2.3: PipelineParams.detect_signal 参数 + pipeline 透传 + CLI 开关（--detect-signal）
+  - [x] SubTask 2.4: 单测：等亮度异色合成图在 oklab 模式检出正确网格、gray 模式默认零回归（新增 tests/test_grid_detect_color_signal.py 15 用例全过；全量 395 通过/1 存量 flaky）
+- [x] Task 3: P2 OKLab 预量化升级
+  - [x] SubTask 3.1: _quantize_detection_signal 升级——OKLAB 空间 median-cut（1/16 子采样，最大方差段优先 + 增量方差）+ cKDTree 最近色映射（float32 + workers=-1）；性能中位 ~1.3s（软目标内）
+  - [x] SubTask 3.2: 量化仅作用检测分支（stages["resize"] 逐位相等单测）
+  - [x] SubTask 3.3: TestImage A/B——oklab+pq 模式 3/5 图 conf 显著提升（image01 +0.27、image02 +0.12、slice_06 +0.085），slice_09 发散；gray 模式 pq 使 conf 降（数据支持默认关）
+- [x] Task 4: G3 峰值格点拟合
+  - [x] SubTask 4.1: _refine_period_peak_lattice(profile, initial_p, min_p, max_p)——find_peaks(prominence=0.05×max) + 按 prominence 降序前 k 峰跳采样扫描（含全峰 k，≤20 次调用，解析梯度）+ L-BFGS-B 间距拟合（RMSE/spacing + 0.5×缺失格比例惩罚）；接受准则 J*<0.15 且偏离投票值 ≤30%，整数吸附收紧为 2% 双证据窗口；失败回退
+  - [x] SubTask 4.2: 集成到 detect()（runs 交叉验证后、px/py 选择前，x/y 两轴各自 profile）+ enable_peak_lattice_fit 开关 + CLI --peak-lattice-fit
+  - [x] SubTask 4.3: 单测 8 个全过：7.5px 合成图（含边界抖动+AA 模拟）OFF=7.000/68×68 → ON=7.490/64×64；16px 整数网格两开关均 16.000/32×32；函数级回退用例；color.py cbrt 向量化顺带完成（rgb_to_oklab 2.2× 加速，_oklab_signal 2048² 2.2s→1.92s，数值偏差 3.79e-16，test_color 全过）
+- [x] Task 5: G2 梳状能量集中度终审
+  - [x] SubTask 5.1: _comb_energy_score(profile, pitch, phase)——捕获能量分数 − 捕获权重分数（花式索引向量化，σ=0.5 平滑缓存）
+  - [x] SubTask 5.2: _comb_best_period——分段最优相位粗扫（段长 ~3 周期，免疫网格落点漂移）+ 细 pitch 网格 ±6% + 8 轮步长折半抛光（pitch 0.002px/相位 0.1px）+ 一致性过滤；平局集 ×1.15 取最大 pitch；整数吸附 ≥0.97；quality×separation 置信度（同族=相对差<5% 或小整数比 k/j≤4）
+  - [x] SubTask 5.3: detect() 终审裁决级（G3 后、px/py 选择前，conf≥0.35 每轴独立覆盖）+ enable_comb_energy_score 开关 + CLI --comb-energy-score + Grid.comb_energy_conf 元信息
+  - [x] SubTask 5.4: 单测 8 个全过（干净 7.5px 网格 OFF=30.000/16×15 → ON=7.496/64×63；16px 整数不劣化；噪声低置信回退）；TestImage 5 图全部安全回退零扰动；性能两轴 ~150ms
+- [x] Task 6: G5 JPEG 网格防护
+  - [x] SubTask 6.1: detect_jpeg_grid(gray)——交叉差分 + 90 分位强响应 64 相位 bincount 投票，阈值校准 0.06（0.12 结构性不可达）；2048² 102ms
+  - [x] SubTask 6.2: 集成——显著时 _vote_period（jpeg_penalty）对 8/16/24±1 候选 edge 分数归一化前乘 0.6（含子谐波修正路径一致性补全）+ jpeg_grid_guard 开关 + CLI + Grid.jpeg_grid 元信息
+  - [x] SubTask 6.3: 单测 12 个全过（含构造的"关则错开则对"案例：弱内容+JPEG q=40 关→24px 误检、开→12px 正确）；TestImage 4 张 jpg 均未触发（保守安全）
+- [x] Task 7: E1 提取向量化 + E2 工程清理
+  - [x] SubTask 7.1: extract_blocks 均匀网格快速路径——method∈{median,mean} 且 cell 坐标 round 后行/列一致等距（含 phase+等距与 _equidistant_cell_grid 兜底）且边界严格递增时向量化（np.take C 连续 + 多轴 median/mean）；否则回退循环零改动；逐位一致单测 10 个全过（合成均匀网格 4-11× 提速，median 0.051s/mean 0.019s vs 循环 0.210s；image02 真实 Grid 非均匀走循环 0.21s 无退化，输出与循环逐位相等）
+  - [x] SubTask 7.2: Q2 cli.py --upscale help 文案修正；Q3 io.save_image 改 Image.Resampling.NEAREST
+- [x] Task 8: 合成回归集 + TestImage A/B + 默认值定型
+  - [x] SubTask 8.1: tests/test_optimization_regression.py——10 用例全过（干净/JPEG q=70、q=85/AA 模拟/噪声 σ=6/非整数 7.5px/等亮度异色（oklab 过 gray 对照挂）/30px+16px 纹理误检压制（无 xfail）/端到端默认断言），固定种子 3.88s
+  - [x] SubTask 8.2: TestImage 5 图 A/B（基线等效 vs 最终默认）：5 图 px/py/逻辑分辨率/conf 完全一致（零扰动），comb_energy_conf 最高 0.338<0.35 未覆盖、jpeg_grid 均未触发
+  - [x] SubTask 8.3: 默认值定型——enable_comb_energy_score/jpeg_grid_guard/enable_peak_lattice_fit → True（G3 加轴一致性防护：orig 一致≤0.05 而精化分裂>0.02 时整体回退，image02 恢复 102×102 且 7.5px 案例保留）；detect_signal 保持 gray、enable_pre_quantize 保持 False；CLI 改 --no-xxx 模式对齐默认；受影响测试已更新
+  - [x] SubTask 8.4: 性能验收 image02.png 全流程 4.12s（≤7s 目标 ✓）；docs/CORE_PIPELINE_ALGORITHMS.md 增补新参数/新判据 §3.12/附录；最终全量 pytest 451 通过/1 存量 flaky
+
+# Task Dependencies
+- Task 1 先行（F1 重构是 Task 2/4/5 的信号基础）
+- Task 2 依赖 Task 1；Task 5 依赖 Task 2（色差剖面）
+- Task 3、Task 6、Task 7 相互独立，可与 Task 2/4/5 并行
+- Task 8 依赖 Task 1-7 全部完成（定型默认值需全量 A/B 数据）

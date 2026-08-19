@@ -28,12 +28,14 @@
 
 | 模块 | 职责 |
 | --- | --- |
-| `src/pipeline.py` | 流水线编排（阶段依赖、缓存、增量重跑）、放大与锐化内联实现 |
+| `src/pipeline.py` | 流水线编排（阶段依赖、缓存、增量重跑）、调整大小（放大）与锐化内联实现 |
 | `src/gui/worker.py` | 流水线异步线程封装（QThread） |
 | `src/core/grid_detect.py` | 网格检测（本文档核心，约 2000 行） |
+| `src/core/scale_detect.py` | runs/GCD 整数尺度检测（网格检测的正交交叉验证先验，见 3.11） |
 | `src/core/extract.py` | 块提取（逐块代表色采样） |
 | `src/core/color_quantize.py` | K-means 调色板精炼 |
 | `src/core/denoise.py` | 降噪（NL-Means / TV / 双边）与 CLAHE |
+| `src/core/aa_removal.py` | 抗锯齿消除预处理（OKLAB 三角形不等式吸附，默认关闭） |
 | `src/core/io.py` | 图像读写与灰度转换 |
 | `src/utils.py` | 图像归一化工具 |
 
@@ -46,7 +48,7 @@
 转换引擎按固定阶段顺序处理图像，每一阶段消费上一阶段的输出，结果缓存复用：
 
 ```
-load → denoise_global → upscale → grid_detect → extract → palette_refine
+load → denoise_global → resize → grid_detect → extract → palette_refine
 ```
 
 阶段前置依赖（`Pipeline.PREREQS`）：
@@ -55,9 +57,9 @@ load → denoise_global → upscale → grid_detect → extract → palette_refi
 | --- | --- | --- |
 | `load` | 无 | `image`（(H,W,3) float64 RGB 0-255） |
 | `denoise_global` | load | `denoise_global` |
-| `upscale` | denoise_global | `upscale` |
-| `grid_detect` | upscale | `grid_detect`（Grid 对象）、`gray`（灰度图，供提取复用） |
-| `extract` | upscale, grid_detect | `extract`（(h_logic, w_logic, 3) uint8） |
+| `resize` | denoise_global | `resize` |
+| `grid_detect` | resize | `grid_detect`（Grid 对象）、`gray`（灰度图，供提取复用） |
+| `extract` | resize, grid_detect | `extract`（(h_logic, w_logic, 3) uint8） |
 | `palette_refine` | extract | `palette_refine`（最终 pixel_art） |
 
 数据流要点：
@@ -65,7 +67,7 @@ load → denoise_global → upscale → grid_detect → extract → palette_refi
 - 输入统一经 `normalize_image` 归一化为 `(H, W, 3)` float64 RGB 0-255；
 - `grid_detect` 阶段同时缓存灰度图（`to_gray`，BT.601 系数），供后续阶段复用，
   避免重复灰度化；
-- `extract` 作用于放大后图像的坐标系（若启用了放大），与网格坐标一致，无需映射回原图；
+- `extract` 作用于调整大小后图像的坐标系（若启用了放大），与网格坐标一致，无需映射回原图；
 - 最终输出 `pixel_art` 为 `(h_logic, w_logic, 3)` uint8 的规范像素图。
 
 ### 2.2 缓存与增量重跑机制
@@ -118,6 +120,11 @@ load → denoise_global → upscale → grid_detect → extract → palette_refi
 | `upscale_factor` | 2 | 放大倍数 |
 | `min_p` / `max_p` | 3 / 40 | 网格候选周期搜索范围（像素） |
 | `snr_threshold` | 8.0 | FFT 网格判定 SNR 阈值 |
+| `detect_signal` | "gray" | 检测信号模式："gray"/"oklab"（G1，等亮度异色块需 oklab） |
+| `enable_pre_quantize` | False | 检测前对检测信号做小调色板预量化（P2，默认关） |
+| `enable_peak_lattice_fit` | True | 峰值格点拟合周期精化（G3，非整数块尺寸如 7.5px） |
+| `enable_comb_energy_score` | True | 梳状能量集中度周期终审（G2，压制子谐波/倍频误检） |
+| `jpeg_grid_guard` | True | JPEG 8×8 网格检测与候选降权（G5，防压缩伪影误检） |
 | `extract_method` | "median" | 块代表色算法 |
 | `extract_core_ratio` | 0.6 | 核心区采样比例 |
 | `enable_palette_refine` | True | 启用 K-means 调色板精炼 |
@@ -136,49 +143,92 @@ DCT 伪影、抗锯齿等干扰，检测必须对这些伪影鲁棒——尤其�
 
 `grid_detect.py::detect(gray, min_p=3, max_p=40, step=0.1, snr_threshold=8.0,
 edge_tol=3, enable_subpixel_refine=True, smooth_strength=0.5,
-outlier_reject_ratio=0.5)`，伪代码：
+outlier_reject_ratio=0.5, comb_weight=0.0, use_comb_prefilter=False,
+enable_runs_crosscheck=True, enable_plausibility_gate=True, signal="gray",
+enable_peak_lattice_fit=False, enable_comb_energy_score=False,
+jpeg_grid_guard=False)`（函数级默认保守关闭；`PipelineParams` 层的
+G2/G3/G5 默认开启并透传），伪代码：
 
 ```python
 # 1. 边缘强度图（一次性计算，后续多处复用）
 edge_map = compute_edge_map(gray)
 
-# 2. FFT 周期粗判：has_pixel_grid 带 ACF 谐波纠正与方向保护
+# 2. 统一信号：归一化灰度只计算一次，FFT 粗判与投票共用同一信号来源，
+#    消除 has_pixel_grid(FFT) 与投票的预处理不一致
+norm_gray = _local_contrast_normalize(gray)
+sig_x = |diff(norm_gray, axis=1)|.sum(axis=0)   # 垂直边缘投影
+sig_y = |diff(norm_gray, axis=0)|.sum(axis=1)   # 水平边缘投影
+
+# 3. FFT 周期粗判：has_pixel_grid 带 ACF 谐波纠正与方向保护
+#    （pre_normalized=True 跳过内部重复归一化；BVR 判据仍用原始 gray）
 has, snr, period, period_x, period_y, snr_x, snr_y = \
-    has_pixel_grid(gray, min_p, max_p, snr_threshold, edge_map)
+    has_pixel_grid(norm_gray, min_p, max_p, snr_threshold, edge_map, pre_normalized=True)
 if not has:
     # FFT 失败回退：梯度投影峰的中位数间距法
     px, py = _estimate_grid_gradient(gray)
 
-# 3. 双轴多判据投票（轴 1 = x 方向、轴 0 = y 方向）
+# 4. 双轴多判据投票（轴 1 = x 方向、轴 0 = y 方向）
+#    G5（jpeg_grid_guard）：投票前 detect_jpeg_grid 交叉差分检测 JPEG 8×8
+#    网格相位，显著（strength ≥ 0.06）时向两轴 _vote_period 传
+#    jpeg_penalty，对 8/16/24 ±1 候选的 edge 分数降权 ×0.6（见 3.12）
 vote_px, conf_x = _vote_period(gray, sig_x, min_p, max_p, axis=1, edge_map=edge_map)
 vote_py, conf_y = _vote_period(gray, sig_y, min_p, max_p, axis=0, edge_map=edge_map)
 
-# 4. 投票结果覆盖 FFT（置信度高，或投票周期的边缘强度显著更优）
+# 5. 投票结果覆盖 FFT（置信度高，或投票周期的边缘强度显著更优；
+#    FFT 主峰易被块内纹理污染，edge 判据不受其影响，故可用 edge 无条件覆盖）
 if conf_x > 0.3 or (e_vote_x > 1e-12 and e_fft_x > 1e-12 and e_vote_x > 1.2 * e_fft_x):
     period_x = vote_px
 # ... y 轴同理
 
-# 5. px/py 策略：
+# 6. runs/GCD 整数尺度交叉验证（Task 4，见 3.11）：
+#    仅当 runs 证据强（runs_x == runs_y > 0 且命中率 >= RUNS_STRONG_HIT_RATE）
+#    时对两轴分别调 _runs_correct_period：
+#      - 与 vote 一致（相对差 <= RUNS_AGREE_REL）：周期吸附为整数 runs
+#      - runs > vote 且 runs ≈ k*vote（k>=2）：投票误检子谐波，
+#        edge(runs) >= RUNS_ADOPT_EDGE_RATIO(0.9)*edge(vote) 时采纳 runs（真实大块）
+#      - runs < vote：默认不缩小周期（防把真实块缩成块内纹理周期），
+#        除非 period >= 3 且 edge(runs) > RUNS_SHRINK_EDGE_RATIO(1.3)*edge(vote)
+#    无证据/不满足时静默回退纯投票结果（零回归）
+
+# 6.5 G3 峰值格点拟合精化（enable_peak_lattice_fit，见 3.12）：
+#     runs 之后、px/py 选择之前，对两轴投影信号做峰值格点拟合，把投票
+#     周期精化为浮点值（支持 7.5px 等非整数块尺寸）；失败自动回退投票值；
+#     轴一致性防护：精化前两轴一致（相对差 ≤ 5%）而精化后分裂（> 2%）
+#     时判定拟合锁错格点，两轴整体回退精化前投票值
+#
+# 6.6 G2 梳状能量终审（enable_comb_energy_score，见 3.12）：
+#     G3 之后、px/py 选择之前，对两轴投影信号做连续 (pitch, phase) 梳状
+#     打分搜索（_comb_best_period）：置信度 ≥ COMB_ACCEPT_CONF(0.35) 且
+#     pitch > 0 时覆盖该轴周期；低置信自动回退 G3/投票链结果
+
+# 7. px/py 策略：
 #    单方向失败 → 统一为另一方向；
 #    相对差 < 0.15 → 按 SNR 加权平均；
 #    否则分开，且长宽比差异 > 0.3 时回退为边界强度更高方向的周期（正方块）
 
-# 6. 相位搜索
+# 8. 高分辨率合理性门控（Task 5，见 3.11）：确定最佳周期后、find_phase 前
+#    周期 < PLAUSIBILITY_MIN_PERIOD(3px) 时链式检查整数倍 k*p：
+#    若某倍周期边界带 >= PLAUSIBILITY_EDGE_RATIO(1.3)*当前边界带，说明小周期
+#    是块内纹理而非网格边界，采纳更大周期并继续放大（2→4→8→…，
+#    至多 PLAUSIBILITY_MAX_STEPS=6 步）；统一正方形块时两轴分别门控后
+#    取一致结果，保持 px == py
+
+# 9. 相位搜索
 phase_x, phase_y, conf = find_phase(gray, px, py, step)   # step=0.1
 
-# 7. 逻辑分辨率：round + 越界容差回退
+# 10. 逻辑分辨率：round + 越界容差回退
 w_logic = _count_blocks(W, px, phase_x)   # 见 3.9
 
-# 8. 方块检测 + BFS 分配 + 边缘引导扩展（新流程，优于等距假设）
+# 11. 方块检测 + BFS 分配 + 边缘引导扩展（新流程，优于等距假设）
 squares   = detect_squares(edge_map, px, py, enable_subpixel_refine=...)
 placed    = assign_grid_bfs(squares, px, py, ...)
 cell_ys, cell_xs = expand_grid_edge_guided(edge_map, placed, bounds, px, py,
                                            edge_tol, smooth_strength, ...)
 # placed 为空时兜底：phase + 等距网格 _equidistant_cell_grid
 
-# 9. 候选分辨率主选 + 邻域（±1）加权，低置信拒绝：
-#    conf < 0.05 且非 FFT 命中 → ValueError
-# 10. 元信息：comb_score = max(comb(sig_x, px), comb(sig_y, py))
+# 12. 候选分辨率主选 + 邻域（±1）加权，低置信拒绝：
+#     conf < 0.05 且非 FFT 命中 → ValueError
+# 13. 元信息：comb_score = max(comb(sig_x, px), comb(sig_y, py))
 ```
 
 `Grid` 数据结构字段：
@@ -193,6 +243,9 @@ Grid(
     cell_ys=None,            # (h_logic+1, w_logic+1) 逐交点 y 坐标
     cell_xs=None,            # (h_logic+1, w_logic+1) 逐交点 x 坐标
     comb_score=0.0,          # 谐波梳得分（元信息）
+    low_confidence=False,    # conf < 0.4 时为 True，供 GUI/元信息提示人工确认
+    comb_energy_conf=0.0,    # G2 梳状终审置信度（两轴均值，仅元信息）
+    jpeg_grid=(),            # G5 JPEG 网格检测结果 (is_significant, phase, strength)
 )
 ```
 
@@ -222,10 +275,12 @@ def compute_edge_map(img) -> (H, W) float64 [0,1]:
 FFT + ACF 交叉验证。
 
 ```python
-def has_pixel_grid(gray, min_p=3, max_p=40, snr_threshold=8.0, edge_map=None):
-    gray = _local_contrast_normalize(gray)      # 局部对比度归一化
-    sig_x = |diff(gray, axis=1)|.sum(axis=0)    # 垂直边缘投影
-    sig_y = |diff(gray, axis=0)|.sum(axis=1)    # 水平边缘投影
+def has_pixel_grid(gray, min_p=3, max_p=40, snr_threshold=8.0, edge_map=None,
+                   pre_normalized=False):
+    if not pre_normalized:
+        gray = _local_contrast_normalize(gray)   # 局部对比度归一化
+    sig_x = |diff(gray, axis=1)|.sum(axis=0)     # 垂直边缘投影
+    sig_y = |diff(gray, axis=0)|.sum(axis=1)     # 水平边缘投影
 
     snr_x, period_x = _fft_band_snr(sig_x, min_p, max_p)
     peaks_x = _acf_period(sig_x, min_p, max_p)
@@ -239,13 +294,18 @@ def has_pixel_grid(gray, min_p=3, max_p=40, snr_threshold=8.0, edge_map=None):
     has = snr >= snr_threshold
 ```
 
+`pre_normalized=True` 时跳过内部 `_local_contrast_normalize`：`detect` 已统一
+计算 `norm_gray` 一次，FFT 粗判与投票使用同一信号来源，避免重复归一化导致
+两阶段预处理不一致。
+
 方向保护的意义：ACF 在小 lag 处的噪声峰可能把正确的 FFT 周期误判为倍频，
 只有"FFT 周期 = ACF 基频 × 整数"且缩小后边界强度不显著下降时才允许纠正。
 
 ### 3.4 _vote_period 四判据投票
 
 `_vote_period(gray, profile, min_p, max_p, axis, edge_map=None,
-comb_weight=0.0, use_comb_prefilter=False)` 是周期选择的最终裁决器。
+comb_weight=0.0, use_comb_prefilter=False, edge_integral=None,
+gray_integral=None, gray_integral_sq=None)` 是周期选择的最终裁决器。
 
 **候选收集**：FFT 主峰 + ACF 峰 + 谐波解释基频 +（新路径启用时）谐波梳
 top-5 候选。
@@ -265,6 +325,13 @@ top-5 候选。
 **性能优化**：2D BVR 需逐周期相位扫描，开销大。新路径先用廉价判据
 （`0.4*acf + 0.3*fft + 0.3*edge`）预排序，只对前 `VOTE_BVR_LIMIT = 10` 名
 候选计算 BVR；旧路径的 legacy BVR（1D 条带）开销小，保持逐候选计算。
+
+**积分图复用**：`detect()` 主路径一次性预构建边缘积分图（`_build_integral`）
+与灰度（及其平方）积分图，经 `edge_integral` / `gray_integral` /
+`gray_integral_sq` 传入 `_vote_period`，`_edge_band_strength`（O(1) 条带求和）
+与 2D BVR（O(1) 块求和）全程复用，消除每个候选周期重复重建整图积分图的
+O(H·W) 开销；参数为 None 时内部惰性构建（向后兼容）。实测 2K 测试图（2048²）
+的 grid_detect 阶段耗时从约 4.9s 降至约 2s，输出逐位一致。
 
 **置信度**：
 
@@ -321,12 +388,16 @@ edge_map）仅支持 k=2,3，条件为 BVR 或 ACF 放大 1.5 倍。
 **2D 块方差对比度（`_block_variance_ratio`）**：
 
 ```python
-def _block_variance_ratio(gray, period, axis):
+def _block_variance_ratio(gray, period, axis, integral=None, integral_sq=None):
     # 2D 真块：按 period 将图像切为 period×period 的块（轴无关，各向同性）
+    # integral/integral_sq 为灰度及其平方的积分图：同时提供时用 O(1) 矩形查询
+    # 求各块和/块平方和（块均值与块内均方同旧实现同一数学，仅求和次序有浮点
+    # 差异），替代旧实现每相位全图 reshape 的 O(H·W) 开销；任一为 None 时回退
+    # 旧实现（保持向后兼容）；_vote_period 复用灰度积分图
     best = 0
     for phase in 相位扫描(步长 step = max(1, period // 4)):
-        cell_means = 各块均值            # 块间
-        within     = 各块内方差的均值      # 块内
+        cell_means = 各块均值            # 块间（积分图 O(1) 块和 / area）
+        within     = 各块内方差的均值      # 块内（O(1) 块平方和 - 均值²）
         between    = var(cell_means)
         best = max(best, between / within)
     return best
@@ -338,9 +409,12 @@ def _block_variance_ratio(gray, period, axis):
 **边界带边缘强度（`_edge_band_strength`）**：
 
 ```python
-def _edge_band_strength(edge_map, period, axis):
+def _edge_band_strength(edge_map, period, axis, phases=None, integral=None):
     # 积分图 O(1) 求条带和：axis=0 取水平边界（行条带），axis=1 取垂直边界
-    # 相位取 0 与 period/2 两处，1px 宽条带
+    # integral 为 edge_map 的预构建积分图（None 时内部构建，向后兼容）：
+    # detect()/_vote_period 主路径只构建一次并复用，消除每候选 O(H·W) 重建
+    # 默认相位采样为 4 相位 {0, p/4, p/2, 3p/4}（Task 6 加密，经子谐波/comb 回归
+    # 验收无回归），1px 宽条带取最大强度；phases 参数可显式覆盖（如回退 {0, p/2}）
     # 返回：条带平均边缘强度
 ```
 
@@ -494,13 +568,199 @@ BVR 只对廉价判据前 10 名候选计算。
 修复：廉价判据预筛 + BVR 限量计算（`VOTE_BVR_LIMIT=10`），nearest 放大全流程
 耗时从 7.4s 降至 4.7s。
 
+**问题 5：投票缺乏「整数放大尺度」的正交先验**
+
+块尺寸的整数尺度（runs/GCD，见 3.11）与 FFT/ACF 投票相互独立，可作为交叉
+验证先验：证据强时吸附/修正投票周期（大块场景的 runs>vote 采纳、防缩小的
+runs<vote 默认不缩小），且无强证据时静默回退纯投票结果（零回归）。
+
+**问题 6：1-2px 生成纹理被误当真实网格**
+
+AI 生成的细小纹理周期过小（<3px），FFT/投票可能误检为真实网格。修复：
+高分辨率合理性门控（见 3.11），周期过小时按整数倍链式检查边界带强度，
+采纳显著更强的更大周期；阈值 1.3 与均匀 2px 格点阵的整数倍比值（≈1.0-1.15）
+保持安全间隔，避免把真实小网格误放大。
+
+### 3.11 runs/GCD 整数尺度检测与高分辨率合理性门控
+
+**runs/GCD 整数尺度检测（`src/core/scale_detect.py::detect_integer_scale`）**
+
+基于像素行程长度 GCD 的整数尺度快速检测，参考 pixel-art-downsampler /
+unfake.js 的 runs 方法：沿采样行/列统计「相邻像素差值 ≤ tol 视为同色」的
+行程长度——像素图中每块均匀色对应一个行程，行程长度为真实块尺寸的整数倍。
+取频次高的行程长度做 GCD 得到整数放大尺度，作为 FFT/ACF 多判据投票的正交
+交叉验证先验（网格检测的第三道防线，区别于 FFT 与投票）。
+
+```python
+def detect_integer_scale(gray, min_p=3, max_p=40, tol=12.0, sample_stride=4):
+    # 每隔 sample_stride 行/列采样一条线，统计行程长度（相邻差值 > tol 处断开）
+    x_runs = 所有采样行的行程长度;  y_runs = 所有采样列的行程长度
+    # 对频次前 8 的行程长度做两两 GCD 得候选尺度（覆盖「行程 = k*scale」）
+    # 对每个候选计算命中率（行程为尺度整数倍、容差内的占比），选命中率最高者；
+    # 命中率相同时取更大尺度（真基频优于其子谐波，避免小尺度偏向）
+    sx, hx = _best_scale_from_runs(x_runs, min_p, max_p, tol)
+    sy, hy = _best_scale_from_runs(y_runs, min_p, max_p, tol)
+    hit_rate = (hx + hy) / 2.0
+    confidence = hit_rate * (1.0 if sx == sy else 0.7)   # x/y 一致性乘子
+    if hit_rate < STRONG_HIT_RATE(0.7): return (0, 0, 0, 0)  # 无强证据
+    return (sx, sy, hit_rate, confidence)
+```
+
+**集成规则（`detect` 内，`enable_runs_crosscheck` 默认开启）**：仅当
+`runs_x > 0 and runs_y > 0 and runs_x == runs_y` 且命中率
+`>= RUNS_STRONG_HIT_RATE(0.7)` 时，对两轴分别调 `_runs_correct_period`
+（常量见附录 A.2）：
+
+| 情形 | 条件 | 动作 |
+| --- | --- | --- |
+| 一致 | \|runs − vote\| / max(runs, vote) ≤ `RUNS_AGREE_REL`(0.2) | 周期吸附为整数 runs |
+| runs > vote | runs ≈ k·vote（k≥2，容差 0.15）且 `edge(runs) ≥ 0.9·edge(vote)` | 投票误检子谐波，采纳 runs（真实大块） |
+| runs < vote | `vote ≥ 3` 且 `edge(runs) > 1.3·edge(vote)` | 缩小周期；否则默认不缩小 |
+
+runs < vote 默认不缩小的动机：块内纹理（如 28px 块 + 7px 纹理）场景下
+runs=7 < vote=28，无显式边界强度证据时不允许把真实块缩成块内纹理周期。
+
+**高分辨率合理性门控（`_plausibility_gate_axis`）**
+
+候选周期过小（< `PLAUSIBILITY_MIN_PERIOD` = 3px，如 1-2px 生成纹理）时，
+检查其整数倍 k·p（k=2..，直至超出 [min_p, max_p]，至多 13 倍）的边界带
+边缘强度：
+
+```python
+def _plausibility_gate_axis(p, edge_map, axis, min_p, max_p):
+    if p >= PLAUSIBILITY_MIN_PERIOD(3): return p      # 周期已合理不放大
+    for _ in range(PLAUSIBILITY_MAX_STEPS(6)):        # 链式放大 2→4→8→…
+        e_cur = _edge_band_strength(edge_map, cur, axis)
+        if e_cur <= 1e-12: break
+        for k in range(2, k_max):                     # 取第一个显著更强的倍周期
+            kp = k * cur
+            if kp < min_p or kp > max_p: continue
+            if _edge_band_strength(edge_map, kp, axis) >= PLAUSIBILITY_EDGE_RATIO * e_cur:
+                cur = kp; break
+    return cur
+```
+
+`PLAUSIBILITY_EDGE_RATIO` = 1.3 的依据：真实 1-2px 格点阵的各整数倍边界带
+比值 ≈1.0-1.15（相位采样总能命中边界线），而「块内 2px 纹理 + 大块网格」
+场景大倍周期命中真实块边界，比值可达 1.3-1.6；阈值取 1.3 在两者之间留有
+安全间隔（0.8 会把均匀 2px 格点阵误放大到 4——红线是真实 2px 网格必须仍
+检出 2）。统一正方形块时两轴分别门控后取一致结果（gx ≥ gy 取 gx），
+保持 px == py。
+
+### 3.12 色差信号、周期精化与终审判据（G1/P2/G3/G2/G5）
+
+本节为网格检测的增强判据层：G1 改换检测信号、P2 预处理检测信号、G3 精化
+周期数值、G2 周期终审、G5 压缩伪影防护。除 G1/P2 外均默认开启
+（`PipelineParams` 层；`detect()` 函数级默认保守关闭），低置信/失败场景
+一律自动回退投票链结果，对真实图的扰动为零。
+
+**G1：OKLAB 色差检测信号（`detect_signal="oklab"`，默认 "gray"）**
+
+等亮度异色块（如纯红块与纯绿块灰度相同）边界在 BT.601 灰度上梯度 ≈ 0，
+灰度路径的边缘图/投影信号/相位搜索全部不可见。`_oklab_signal` 改用 OKLAB
+感知色差构造检测信号：投影信号对 OKLAB 每通道独立做局部对比度归一化
+（弱色度边缘被有界放大）后取相邻像素差分的 L2 范数沿另一轴求和，与灰度
+路径投影信号同形同义；边缘图为原始 OKLAB 前向差分的逐像素幅值。BVR、
+runs 交叉验证、梯度回退等灰度判据仍基于 BT.601 灰度（语义不变）；2D 输入
+恒走灰度路径。默认保持 "gray"：真实图上混合结果（个别图 conf 提升但
+slice_09 发散），仅等亮度异色场景显式开启。
+
+**P2：OKLab 预量化（`enable_pre_quantize`，默认关）**
+
+`pipeline.py::_quantize_detection_signal` 对检测信号做小调色板量化（全图
+1/16 子采样 → 样本转 OKLab 做 median-cut 聚类 → 全图 cKDTree 最近邻映射），
+把 AA 过渡带阶跃化、块内渐变坍缩为零梯度，提升边界可检测性。仅改变
+**检测信号**（不改变提取/输出信号）；gray 模式下实测 conf 下降
+（image01 0.633→0.478），默认关闭，仅 oklab 模式配合使用。
+
+**G3：峰值格点拟合周期精化（`enable_peak_lattice_fit=True`）**
+
+投票/runs 输出的周期常为整数或粗估值（真实案例 7.45/7.48px 非整数）。
+`_refine_period_peak_lattice` 参考 Pixel-Extractor 的峰值格点拟合范式：
+投影信号按 prominence 找峰（阈值 0.05×max 起步，峰 <4 逐级放宽到
+0.02/0.01），把峰视为格线采样，L-BFGS-B 最小化
+`J(s) = sqrt(mean((spacings − round(spacings/s)·s)²))/s + α·missing_ratio`
+（α=0.5，missing_ratio 为首末峰间缺失格线比例，惩罚子谐波）。接受准则
+`J* < 0.15` 且 `|s* − initial_p|/initial_p ≤ 0.3`，否则回退投票值；
+投票值与拟合值双重一致（偏移 ≤ 2%）且贴近整数（< 0.02·s*）时吸附整数，
+保持干净整数网格位精确。
+
+**轴一致性防护**：正方形网格两轴投影来自同一格点结构，精化成功时两轴
+周期应几乎一致。若投票周期本就两轴一致（相对差 ≤
+`PEAK_LATTICE_AXIS_ORIG_REL` = 5%）而精化后显著分裂（相对差 >
+`PEAK_LATTICE_AXIS_GUARD_REL` = 2%，如 image02 的 x 回退 20.0 / y 精化
+20.804，分裂 3.9%），判定单轴拟合锁错格点，两轴整体回退精化前投票值。
+两轴同时精化失败（refined == orig）时回退为无操作；原本两轴就不一致的
+非方格（如 slice_01 的 8/7）精化各自独立进行，不适用本防护。
+
+**G2：梳状能量集中度终审（`enable_comb_energy_score=True`）**
+
+对投影信号做连续 (pitch, phase) 梳状打分，原理性压制投票链的子谐波/倍频
+误检。打分公式（`_comb_energy_score`）：
+
+```python
+# 梳齿位置 pos_k = round(phase + k·pitch)，每齿 1px 采样捕获能量
+E = Σ profile[pos_k]
+score = E / total_energy − n_teeth / n_positions
+# 惩罚项 n_teeth/n 为随机取位的期望能量占比（score > 0 即高于随机基线）
+```
+
+真周期 P 命中全部边界能量且齿数最少；子谐波 P/2 以双倍齿数仅多捕获块内
+噪声（惩罚翻倍必然更低分）、倍频 2P 漏一半边界（能量减半），数学上均
+严格低于真周期——不依赖经验阈值。搜索流程（`_comb_best_period`）：σ=0.5
+轻高斯平滑（容忍 AA 相位散布）→ pitch 2% 相对步长粗扫（每 pitch 分段
+最优相位打分，对网格误差免疫）→ 前 3 个不同峰（8% 去重窗口）各自做
+细 pitch 网格 × 全相位扫描 + 步长折半抛光 → 裁决：平局集（分数 ≥
+best/1.15）中取最大 pitch（谐波家族最大竞争者即真值），整数吸附（round
+后分数 ≥ 0.97×best）。
+
+裁决规则：`confidence = quality × separation`（quality = 能量集中度
+clamp(best_score, 0, 1)，separation = (best − 次优非同族分数)/best）。每轴
+独立接受：`confidence ≥ COMB_ACCEPT_CONF`(0.35) 且 pitch > 0 时覆盖该轴
+周期，低置信自动回退 G3/投票链结果（真实图全部低置信回退，零扰动；合成
+硬边 7.5px 网格修复投票锁 30px 的对齐倍数误检：30.000/16×15 →
+7.496/64×63）。梳相位仅作参考不透传 find_phase。两轴置信度均值记入
+`Grid.comb_energy_conf` 供 A/B 分析。
+
+**G5：JPEG 8×8 网格防护（`jpeg_grid_guard=True`）**
+
+`detect_jpeg_grid`（参考 IPOL 2020 交叉差分法）：交叉差分
+`C(x,y) = I(x+1,y+1) − I(x+1,y) − I(x,y+1) + I(x,y)` 抵消真实内容边缘
+（一阶差分成对相减），仅保留量化阶跃在 JPEG 块角点的混合二阶差分响应。
+对 64 个可能网格原点投票：只取强响应位置（|C| 超过 90 分位）投给
+`(y mod 8, x mod 8)` bin，峰 bin 占比为 strength——JPEG 网格全部角点
+mod 8 落入同一 bin，自然图像近似均匀铺满 64 bins。
+
+| 参数 | 值 | 说明 |
+| --- | --- | --- |
+| 显著性阈值 | `JPEG_GRID_STRENGTH_THRESHOLD` = 0.06 | 均匀期望 1/64≈0.0156 的约 3.8 倍；q=70 压缩实测 0.08-0.11（显著），PNG 对照 0.02-0.03（不显著） |
+| 惩罚因子 | `JPEG_PENALTY_FACTOR` = 0.6 | 显著时对候选 c ∈ {7,8,9,15,16,17,23,24,25}（8/16/24 ±1）的 edge 分数乘 0.6（归一化前施加，实现候选间相对降权） |
+| 作用范围 | 仅投票链 | G2 梳状终审/G3 峰值拟合为图像域独立判据，不受惩罚影响 |
+
+检测结果 `(is_significant, phase, strength)` 记入 `Grid.jpeg_grid` 供
+A/B 分析；真实图阈值 0.06 下均未触发（strength 0.017-0.020），零扰动。
+
+**元信息（metadata）变化**：`Pipeline` 的 `metadata` 字典在原有
+`w_logic/h_logic/px/py/grid_conf/unique_colors/extract_method` 基础上
+新增 `low_confidence`（`conf < 0.4` 时为 True，供 GUI 提示人工确认）；
+`comb_energy_conf` 与 `jpeg_grid` 通过 `Grid` 对象暴露（`result.grid`）。
+
+**E1：提取均匀网格快速路径（自动触发）**
+
+`extract.py::extract_blocks` 在均匀网格（`cell_ys/cell_xs` 为 None 的
+phase+等距模型，或逐交点坐标等距）且 `method` 为 `median`/`mean` 时
+走 `_extract_uniform_fast` 向量化快速路径：逐行带切片 + 按块宽分组的
+`np.median/np.mean`（两算法结果仅由像素集合决定，与逐块循环逐位等价），
+大图提速一个数量级；不均匀网格、`mode`/`kmeans`/`dominant` 方法或边界
+退化时自动回退逐块路径（结果不变）。
+
 ---
 
 ## 4 块提取 extract
 
 `extract.py::extract_blocks(img, grid, method="median", core_ratio=0.6)` 将每个
-块压缩为 1 个代表色像素，直接输出逻辑分辨率的真像素图（合并了原 block_refine
-与 downscale 的功能）。
+块压缩为 1 个代表色像素，直接输出逻辑分辨率的真像素图。`method` 支持
+`median`/`mean`/`mode`/`kmeans`/`dominant`。
 
 ```python
 def extract_blocks(img, grid, method="median", core_ratio=0.6):
@@ -533,6 +793,11 @@ def extract_blocks(img, grid, method="median", core_ratio=0.6):
             if method == "mode":    # /32 量化后取众数 bin，再取 bin 内像素均值
                 quantized = round(core / 32);  mode_q = argmax 众数
                 rep = mean(quantized == mode_q 的像素)
+            if method == "dominant":  # 感知空间分 bin 取众数，bin 内原始 RGB 均值
+                space_px = rgb_to_oklab(core)       # 优先 OKLab（步长 0.02），
+                                                    # 未就绪回退 Lab（步长 5）
+                quantized = round(space_px / step);  mode_q = argmax 众数 bin
+                rep = mean(space_px == mode_q 的原始 RGB 像素)
 
             out[j, i] = clip(rep, 0, 255)
 ```
@@ -544,18 +809,27 @@ def extract_blocks(img, grid, method="median", core_ratio=0.6):
   对称处理两个方向，保证相邻块不共享像素；
 - **空块回填**：行方向用同行左邻值，否则用上一行同列值；
 - **kmeans 方法**并非真正 K-means，而是"中位数主色 + 25 分位距离阈值"的轻量
-  渗透色分离，速度远快于聚类。
+  渗透色分离，速度远快于聚类；
+- **dominant 方法**把核心区像素转到感知空间（优先 OKLab，回退 Lab），对
+  小步长量化 bin 取众数，再取该 bin 内原始 RGB 像素均值作主色——比 mode 的
+  RGB `/32` 量化更贴近人眼感知（Lab 通道步长 4-6 区间，OKLab 步长 0.02）；
+- **均匀网格快速路径（E1，自动触发）**：均匀网格 + `median`/`mean` 时走
+  `_extract_uniform_fast` 向量化路径（逐行带切片 + 分组聚合，与逐块循环
+  逐位等价），详见 3.12「E1」段。
 
 ---
 
 ## 5 调色板精炼 color_quantize
 
-`color_quantize.py::color_quantize(img, n_colors=16)` 用 K-means 将图像颜色
-量化为有限簇心，每个像素吸附到最近簇心。渐变过渡区域自动变为硬边界（阶跃），
-且不会超出 [0,255]（无 unsharp mask 的白边问题）。
+`color_quantize.py::color_quantize(img, n_colors=16, space="rgb")` 用 K-means
+将图像颜色量化为有限簇心，每个像素吸附到最近簇心。`space` 指定聚类颜色空间：
+`"rgb"`（默认，与旧行为完全一致）/ `"lab"` / `"oklab"`；后两者将像素转到
+对应感知空间做 KMeans（聚类更贴近人眼感知），簇心映射回 RGB 得到最终量化图。
+渐变过渡区域自动变为硬边界（阶跃），且不会超出 [0,255]（无 unsharp mask 的
+白边问题）。
 
 ```python
-def color_quantize(img, n_colors=16):
+def color_quantize(img, n_colors=16, space="rgb"):
     pixels = img.reshape(-1, 3).astype(float64)
 
     if len(pixels) < n_colors: return img.copy()      # 像素太少
@@ -566,16 +840,27 @@ def color_quantize(img, n_colors=16):
 
     if len(unique_colors) <= n_colors: return img.copy()   # 无需聚类
 
+    # 按 space 转聚类输入：rgb 直用唯一色；lab/oklab 转到感知空间（簇心需映射回 RGB）
+    fit_colors = unique_colors if space == "rgb" else rgb_to_lab/oklab(unique_colors)
+
     # 对唯一色加权聚类（sample_weight = 频次，避免重复像素重复计算）
     kmeans = KMeans(n_clusters=n_colors, random_state=42, n_init=3)
-    kmeans.fit(unique_colors, sample_weight=counts)
+    kmeans.fit(fit_colors, sample_weight=counts)
+
+    # 感知空间聚类的簇心映射回 RGB（lab_to_rgb / oklab_to_rgb）
+    centers = lab_to_rgb/oklab_to_rgb(kmeans.cluster_centers_) if space != "rgb" else centers
 
     # 仅对唯一色 predict，再经 inverse 索引映射回所有像素
-    all_labels = kmeans.predict(unique_colors)[inverse]
+    all_labels = kmeans.predict(fit_colors)[inverse]
     quantized  = centers[all_labels].reshape(H, W, 3)
 
     # 还原 dtype：整型 clip+round 到 dtype 最大值
 ```
+
+`src/core/color.py` 提供 `rgb_to_lab`/`lab_to_rgb`（基于 skimage）与
+`rgb_to_oklab`/`oklab_to_rgb`（基于 Björn Ottosson 的 OKLab 公式，感知均匀性
+优于 Lab），供 `space="lab"/"oklab"` 使用；`oklab_to_rgb` 对越出 sRGB 色域的
+值裁剪到 [0,255]。
 
 ---
 
@@ -596,26 +881,64 @@ skimage，再还原回 [0,255]。
 逐通道调用 `skimage.exposure.equalize_adapthist`（避免部分版本 `adapt_rgb`
 转发 `channel_axis` 引发的 TypeError），提升网格检测对低对比度区域的识别。
 
----
+**抗锯齿消除（`remove_anti_aliasing`）**
 
-## 7 放大与锐化 upscale
-
-放大逻辑内联于 `pipeline.py::_run_upscale`（无独立模块）。
+`aa_removal.py::remove_anti_aliasing(img_rgb, threshold=0.5, passes=2)` 在
+`denoise_global` 阶段内（`enable_aa_removal=True` 时）清理 AI 伪像素图块
+边界/网格线上的 1px 线性混合（抗锯齿）杂色，默认关闭。算法在 OKLAB 感知
+空间用「三角形不等式」判定当前像素颜色是否位于邻域两主色之间，若是则吸附
+到较近的主色，把混合色清理为纯块色：
 
 ```python
-def _run_upscale(img, factor, method):
-    if method == "nearest":
-        # np.repeat 无插值：逐行逐列重复（像素艺术保持锐利）
-        img = np.repeat(np.repeat(img, factor, axis=0), factor, axis=1)
-    else:
-        # skimage.transform.resize，order 映射：
-        #   nearest=0, bilinear=1, bicubic=3, lanczos=5
-        # anti_aliasing=False（保持锐边）、preserve_range=True
-        img = resize(img, (H*factor, W*factor), order=order_map[method],
-                     anti_aliasing=False, preserve_range=True)
+def remove_anti_aliasing(img_rgb, threshold=0.5, passes=2):
+    oklab = _rgb_to_oklab(img_rgb)                  # 模块内自带 OKLAB 转换
+    for _ in range(max(1, passes)):                 # 重复迭代收敛宽 AA 过渡带
+        # 1) 8 邻域颜色按 RGB 每通道 32 级粗量化归为类别
+        # 2) 取 8 邻域内频次最高的前两类作主色 a、b（含排除中心色的回退判定）
+        # 3) 仅当 d(a,b) > threshold（两主色足够不同）才继续，避免破坏细节
+        # 4) 三角形不等式：|d(p,a)+d(p,b)-d(a,b)| / d(a,b) 小于容差
+        #    → p 位于 a-b 之间（AA 混合色）；主路径容差 _TRIANGLE_TOL=0.4，
+        #      交叉 AA 回退路径用更严格的 _STRICT_TOL=0.05（防纯色角点误判）；
+        #    且要求 p 与 a、b 均明显不同（真混合色而非纯块色）
+        # 5) 吸附到更近的主色 a/b（平局取 a）
+    return clip(arr, 0, 255)
+```
+
+参考 pixfix（lovelaced/pixfix）的 OKLAB 三角形不等式 AA 消除思路；模块内
+自包含（自带约 15 行向量化 OKLAB 转换），不依赖 `color.py`。
+
+---
+
+## 7 调整大小 resize（放大）
+
+调整大小逻辑内联于 `pipeline.py::_run_resize`（无独立模块），执行顺序固定为：
+
+1. **放大**（若 `enable_upscale=True`）：提升网格检测分辨率；
+2. **可选锐化**（若 `enable_sharpen=True`）：unsharp mask 提锐放大结果。
+
+```python
+def _run_resize(img):
+    # 1) 先放大（默认关闭）
+    if enable_upscale and upscale_factor > 1:
+        if method == "nearest":
+            # np.repeat 无插值：逐行逐列重复（像素艺术保持锐利）
+            img = np.repeat(np.repeat(img, factor, axis=0), factor, axis=1)
+        else:
+            # skimage.transform.resize，order 映射：
+            #   nearest=0, bilinear=1, bicubic=3, lanczos=5
+            # anti_aliasing=False（保持锐边）、preserve_range=True
+            img = resize(img, (H*factor, W*factor), order=order_map[method],
+                         anti_aliasing=False, preserve_range=True)
+    # 2) 可选锐化（unsharp mask），仍在放大后
     if enable_sharpen:
         img = _unsharp_mask(img, strength)
+    return img
 ```
+
+resize 阶段仅保留放大语义（缩小/块降采样功能已整体移除，含
+`downsample_blocks` 及 `enable_downscale`/`downscale_factor`/`downscale_method`
+参数）。`grid_detect`/`extract` 均在放大后图像的坐标系上工作，与网格坐标一致；
+`min_p`/`max_p` 无需做任何折算。
 
 **Unsharp Mask（`_unsharp_mask`）**：
 
@@ -668,11 +991,15 @@ gray = 0.299 * R + 0.587 * G + 0.114 * B
 | `ai_denoise_strength` | 0.5 | 降噪 | 去噪强度 0-1 |
 | `enable_clahe` | False | 降噪 | CLAHE 局部对比度增强 |
 | `clahe_clip_limit` | 0.03 | 降噪 | CLAHE 裁剪限制 0.01-0.1 |
-| `enable_upscale` | False | 放大 | 默认不放大（最近邻放大引入格点伪周期） |
-| `upscale_factor` | 2 | 放大 | 放大倍数 |
-| `upscale_method` | "nearest" | 放大 | nearest/bilinear/bicubic/lanczos |
-| `enable_sharpen` | False | 放大 | unsharp mask 锐化（有白边风险，默认关） |
-| `sharpen_strength` | 0.5 | 放大 | 锐化强度 0-1 |
+| `enable_aa_removal` | False | 降噪 | 抗锯齿消除预处理（OKLAB 三角形不等式吸附，默认关） |
+| `aa_removal_passes` | 2 | 降噪 | AA 消除迭代次数 |
+| `aa_removal_threshold` | 0.5 | 降噪 | AA 两主色距离阈值（低于不做吸附） |
+| `denoise_grid_guard` | False | 降噪 | 去噪过强时自动减半强度重去噪一次（默认关） |
+| `enable_upscale` | False | 调整大小 | 默认不放大（最近邻放大引入格点伪周期） |
+| `upscale_factor` | 2 | 调整大小 | 放大倍数 |
+| `upscale_method` | "nearest" | 调整大小 | nearest/bilinear/bicubic/lanczos |
+| `enable_sharpen` | False | 调整大小 | unsharp mask 锐化（有白边风险，默认关） |
+| `sharpen_strength` | 0.5 | 调整大小 | 锐化强度 0-1 |
 | `min_p` | 3 | 网格检测 | 最小候选周期（像素） |
 | `max_p` | 40 | 网格检测 | 最大候选周期（像素） |
 | `user_hint` | None | 网格检测 | 用户逻辑分辨率提示 (w,h) |
@@ -682,7 +1009,12 @@ gray = 0.299 * R + 0.587 * G + 0.114 * B
 | `enable_subpixel_refine` | True | 网格检测 | 亚像素精炼 |
 | `smooth_strength` | 0.5 | 网格检测 | 全局正则化混合强度（0=纯观测，1=纯模型） |
 | `outlier_reject_ratio` | 0.5 | 网格检测 | 离群间距剔除阈值比例 |
-| `extract_method` | "median" | 提取 | median/mean/mode/kmeans |
+| `detect_signal` | "gray" | 网格检测 | 检测信号模式 gray/oklab（G1；oklab 供等亮度异色块，默认 gray） |
+| `enable_pre_quantize` | False | 网格检测 | 检测前对检测信号做小调色板预量化（P2，默认关） |
+| `enable_peak_lattice_fit` | True | 网格检测 | 峰值格点拟合周期精化（G3，含轴一致性防护，默认开） |
+| `enable_comb_energy_score` | True | 网格检测 | 梳状能量集中度周期终审（G2，低置信自动回退，默认开） |
+| `jpeg_grid_guard` | True | 网格检测 | JPEG 8×8 网格检测与候选降权（G5，默认开） |
+| `extract_method` | "median" | 提取 | median/mean/mode/kmeans/dominant |
 | `extract_core_ratio` | 0.6 | 提取 | 核心区采样比例 0.5-1.0 |
 | `fix_square` | False | 提取 | 逻辑分辨率与正方形差 1 时自动修正 |
 | `enable_palette_refine` | True | 精炼 | 启用 K-means 调色板精炼 |
@@ -708,6 +1040,26 @@ gray = 0.299 * R + 0.587 * G + 0.114 * B
 | 全局正则单调间距 | 0.3 × period | 网格线最小间距 |
 | 谐波梳 | k = 1..8，基准中位数×8 | 周期判别 |
 | 2D BVR 相位步长 | max(1, period // 4) | 相位扫描 |
+| `RUNS_STRONG_HIT_RATE` | 0.7 | runs 视为强证据的命中率下限（grid_detect 集成口径） |
+| `RUNS_AGREE_REL` | 0.2 | runs 与 vote 一致的相对差阈值 |
+| `RUNS_ADOPT_EDGE_RATIO` | 0.9 | runs > vote 采纳 runs 所需边界强度比 |
+| `RUNS_SHRINK_EDGE_RATIO` | 1.3 | runs < vote 缩小周期所需显式边界强度比 |
+| `PLAUSIBILITY_MIN_PERIOD` | 3 | 触发高分辨率门控的最小周期（1-2px 生成纹理） |
+| `PLAUSIBILITY_EDGE_RATIO` | 1.3 | 采纳更大倍周期的边界带强度比 |
+| `PLAUSIBILITY_MAX_STEPS` | 6 | 链式放大的最大步数（2→4→8→…） |
+| runs 同色容差 | tol = 12.0 | `detect_integer_scale` 判定同色的像素差值（灰度级） |
+| runs 采样间隔 | sample_stride = 4 | `detect_integer_scale` 每隔该行/列采样一条线 |
+| `PEAK_LATTICE_MIN_PEAKS` / `MAX_FITS` | 4 / 20 | G3 拟合最少峰数 / k 扫描 minimize 调用数上限 |
+| `PEAK_LATTICE_MAX_J` / `MAX_REL` | 0.15 / 0.3 | G3 接受精化的目标值上限 / 相对投票值偏移上限 |
+| `PEAK_LATTICE_AXIS_GUARD_REL` | 0.02 | G3 轴一致性防护：精化后两轴相对分裂超过该值触发回退 |
+| `PEAK_LATTICE_AXIS_ORIG_REL` | 0.05 | G3 轴一致性防护：精化前两轴视为一致的相对差上限 |
+| `COMB_ACCEPT_CONF` | 0.35 | G2 终审采纳置信度阈值（低于回退投票链结果） |
+| G2 粗扫 pitch 步长 | COMB_COARSE_REL_STEP = 0.02 | 相对步长 ~2%（[3,40] 约 131 个候选） |
+| G2 精化候选 | COMB_REFINE_TOP_K = 3，去重窗口 0.08 | 粗扫分数前 3 个不同峰做细网格搜索 |
+| `JPEG_GRID_STRENGTH_THRESHOLD` | 0.06 | G5 JPEG 网格显著性阈值（峰 bin 占比，均匀期望 ≈0.0156） |
+| `JPEG_PENALTY_FACTOR` | 0.6 | G5 对 8/16/24 ±1 候选的 edge 分数降权因子 |
+| `JPEG_PENALTY_PERIODS` | {7,8,9,15,16,17,23,24,25} | G5 惩罚的候选周期集合（8/16/24 ±1） |
+| `JPEG_GRID_QUANTILE` | 90.0 | G5 交叉差分响应参与投票的分位（仅强响应投票） |
 
 ---
 

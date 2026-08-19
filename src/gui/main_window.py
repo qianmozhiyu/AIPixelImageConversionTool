@@ -43,10 +43,10 @@ from .assets_page import AssetsPage
 from .settings_page import SettingsPage
 
 
-STAGE_KEYS = ["denoise", "upscale", "grid_detect", "extract", "palette_refine", "preview"]
+STAGE_KEYS = ["denoise", "resize", "grid_detect", "extract", "palette_refine", "preview"]
 STAGE_LABELS = {
     "denoise": "AI 降噪",
-    "upscale": "放大",
+    "resize": "调整大小",
     "grid_detect": "网格检测",
     "extract": "块提取",
     "palette_refine": "调色板精炼",
@@ -55,7 +55,7 @@ STAGE_LABELS = {
 # UI 阶段键 -> pipeline stages 字段名映射
 STAGE_TO_PIPELINE = {
     "denoise": "denoise_global",
-    "upscale": "upscale",
+    "resize": "resize",
     "grid_detect": "grid_detect",
     "extract": "extract",
     "palette_refine": "palette_refine",
@@ -459,17 +459,17 @@ class MainWindow(QMainWindow):
             self.canvas.set_image(np.clip(arr, 0, 255))
             self.canvas.set_grid_overlay(None)
             self.canvas.set_info("AI 降噪")
-        elif key == "upscale":
-            arr = stages.get("upscale")
+        elif key == "resize":
+            arr = stages.get("resize")
             if arr is not None:
                 self.canvas.set_image(np.clip(arr, 0, 255))
                 self.canvas.set_grid_overlay(None)
-                self.canvas.set_info("放大")
+                self.canvas.set_info("调整大小")
             else:
                 self._show_original()
                 return
         elif key == "grid_detect":
-            arr = stages["upscale"]
+            arr = stages["resize"]
             grid = stages["grid_detect"]
             self.canvas.set_image(np.clip(arr, 0, 255))
             self.canvas.set_grid_overlay(grid)

@@ -6,16 +6,22 @@
 
 主要接口：
 - ``has_pixel_grid``：判断灰度图是否包含像素网格周期。
-- ``find_phase``：在已知块尺寸下扫描最佳网格相位。
-- ``detect``：自动检测块尺寸与相位，返回 ``Grid``。
+- ``find_phase``：在已知块尺寸下扫描最佳网格相位（灰度块方差判据）。
+- ``find_phase_edge``：在边缘强度图上扫描最佳网格相位（边界带能量判据）。
+- ``detect``：自动检测块尺寸与相位，返回 ``Grid``。``signal="oklab"`` 时
+  用 OKLAB 感知色差做检测信号，等亮度异色块边界可见（默认 ``"gray"``）。
 - ``detect_with_user_grid``：用户指定逻辑分辨率，反推块尺寸并定相。
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
+
+from src.core.scale_detect import detect_integer_scale
+from src.core.color import rgb_to_oklab
 
 
 @dataclass
@@ -53,6 +59,9 @@ class Grid:
     cell_ys: np.ndarray | None = None  # (h_logic+1, w_logic+1) 网格交点 y 坐标
     cell_xs: np.ndarray | None = None  # (h_logic+1, w_logic+1) 网格交点 x 坐标
     comb_score: float = 0.0  # Spectral Comb 周期得分（可选元信息，默认 0）
+    low_confidence: bool = False  # conf < 0.4 时为 True，供 GUI/元信息提示人工确认
+    comb_energy_conf: float = 0.0  # 梳状能量终审置信度（两轴均值，仅元信息，默认 0）
+    jpeg_grid: tuple = ()  # JPEG 网格检测结果 (is_significant, phase, strength)，默认空 tuple
 
 
 def _linear_extrap_pad(g: np.ndarray, p: int) -> np.ndarray:
@@ -131,6 +140,27 @@ def _local_contrast_normalize(gray: np.ndarray, window: int = 33) -> np.ndarray:
     eff_std = np.clip(local_std, 0.5 * global_std, global_std)
     normalized = (g - local_mean) / eff_std
     return normalized[p:-p, p:-p]
+
+
+def _build_integral(a: np.ndarray) -> np.ndarray:
+    """构建 (H+1, W+1) float64 二维积分图。
+
+    积分图 ``I[i+1, j+1] = sum(a[:i+1, :j+1])``（首行首列为 0），用于
+    O(1) 矩形区域求和：``sum(rect) = I[y1,x1]-I[y0,x1]-I[y1,x0]+I[y0,x0]``。
+    构建方式与 ``_edge_band_strength`` / ``detect_squares`` 中的积分图完全
+    一致，供网格检测各阶段复用，避免同一边缘/灰度图被反复重建（大图下
+    每次构建 O(H·W) 是主要热点）。
+
+    Args:
+        a: 2D 数组（float64 或可转换）。
+
+    Returns:
+        ``(H+1, W+1)`` float64 积分图。
+    """
+    a = np.asarray(a, dtype=np.float64)
+    I = np.zeros((a.shape[0] + 1, a.shape[1] + 1), dtype=np.float64)
+    I[1:, 1:] = np.cumsum(np.cumsum(a, axis=0), axis=1)
+    return I
 
 
 def _fft_band_snr(sig: np.ndarray, min_p: int, max_p: int) -> tuple[float, float]:
@@ -344,7 +374,9 @@ def _block_variance_ratio_legacy(
 
 
 def _block_variance_ratio(
-    gray: np.ndarray, period: float, axis: int = 0
+    gray: np.ndarray, period: float, axis: int = 0,
+    integral: np.ndarray | None = None,
+    integral_sq: np.ndarray | None = None,
 ) -> float:
     """计算 2D 真块方差对比度（块间方差 / 块内方差），真网格此值最大。
 
@@ -352,12 +384,20 @@ def _block_variance_ratio(
     以相位扫描找最优对齐，计算块均值序列方差（块间）与各块内方差均值
     （块内）之比。真网格对齐时块内同质、块间差异大，比值高。
 
+    ``integral`` / ``integral_sq`` 为灰度及其平方的积分图：同时提供时用
+    O(1) 积分图块求和（块和 = 矩形查询；均值/块内均方与旧实现同一数学，
+    仅求和次序有浮点差异），避免每相位全图 reshape 的 O(H·W) 开销；
+    任一为 None 时回退旧实现的逐块 reshape 计算（保持向后兼容）。
+    相位扫描步长与旧实现一致（``step = max(1, p_i//4)``）。
+
     参数 ``axis`` 为兼容既有调用保留（2D 实现各向同性，不再分方向）。
 
     Args:
         gray: 灰度图数组 (H, W)。
         period: 候选周期（像素）。
         axis: 兼容参数，不影响结果。
+        integral: 灰度积分图 (H+1, W+1)；None 时回退旧实现。
+        integral_sq: 灰度平方积分图 (H+1, W+1)；None 时回退旧实现。
 
     Returns:
         方差对比度比值。越大越好。失败时返回 0.0。
@@ -372,6 +412,11 @@ def _block_variance_ratio(
     p_i = int(round(p))
     if p_i < 1:
         return 0.0
+    use_integral = integral is not None and integral_sq is not None
+    if use_integral:
+        I = integral
+        I2 = integral_sq
+        area = float(p_i * p_i)
     best = 0.0
     # 相位扫描：步长随周期缩放，限制每候选相位数（≤~16，投票用弱判据无需过密）
     step = max(1, p_i // 4)
@@ -385,11 +430,25 @@ def _block_variance_ratio(
             if n_x < 2:
                 continue
             cx = px0 + n_x * p_i
-            cell = g[py0:cy, px0:cx].reshape(n_y, p_i, n_x, p_i)
-            cell_means = cell.mean(axis=(1, 3))  # (n_y, n_x)
-            cell_sq = (cell * cell).mean(axis=(1, 3))
-            within = float(np.mean(cell_sq - cell_means * cell_means))
-            between = float(np.var(cell_means))
+            if use_integral:
+                # O(1) 块求和（积分图矩形查询）：块角点 = I[py0+i*p_i, px0+j*p_i]，
+                # 用积分图子块的步长切片一次性取全部角点（避免逐相位 np.ix_
+                # fancy indexing 的 gather 开销，小周期大量小块时提速明显）；
+                # 块均值与块内均方同旧实现数学（同一求和次序）。
+                corners = I[py0:cy + 1, px0:cx + 1][::p_i, ::p_i]  # (n_y+1, n_x+1)
+                s = corners[1:, 1:] - corners[:-1, 1:] - corners[1:, :-1] + corners[:-1, :-1]
+                corners2 = I2[py0:cy + 1, px0:cx + 1][::p_i, ::p_i]
+                sq = corners2[1:, 1:] - corners2[:-1, 1:] - corners2[1:, :-1] + corners2[:-1, :-1]
+                block_means = s / area  # (n_y, n_x)
+                block_sq_means = sq / area
+                within = float(np.mean(block_sq_means - block_means * block_means))
+                between = float(np.var(block_means))
+            else:
+                cell = g[py0:cy, px0:cx].reshape(n_y, p_i, n_x, p_i)
+                cell_means = cell.mean(axis=(1, 3))  # (n_y, n_x)
+                cell_sq = (cell * cell).mean(axis=(1, 3))
+                within = float(np.mean(cell_sq - cell_means * cell_means))
+                between = float(np.var(cell_means))
             if within < 1e-12:
                 ratio = 0.0 if between < 1e-12 else 1e6
             else:
@@ -399,8 +458,24 @@ def _block_variance_ratio(
     return float(best)
 
 
+def _default_edge_band_phases(p: float) -> tuple[float, ...]:
+    """``_edge_band_strength`` 默认相位采样集合。
+
+    Task 6 决策记录：试验把默认相位加密到 4 相位 (0, p/4, p/2, 3p/4) 取最大
+    边界带强度，并以 test_grid_detect_subharmonic 与 test_grid_detect_comb
+    为验收口径（子谐波修正依赖 >1.3 的边界强度比）。实测 4 相位未导致任何
+    回归（两组用例全部通过），故采纳 4 相位为默认，相位感知更鲁棒（相位偏移
+    时仍能命中边界带）。`phases` 参数保留供显式覆盖（如回退 {0, p/2}）。
+    """
+    return (0.0, p / 4.0, p / 2.0, 3.0 * p / 4.0)
+
+
 def _edge_band_strength(
-    em: np.ndarray, period: float, axis: int = 0
+    em: np.ndarray,
+    period: float,
+    axis: int = 0,
+    phases: Sequence[float] | None = None,
+    integral: np.ndarray | None = None,
 ) -> float:
     """边界带边缘强度：候选周期下，块边界位置 1px 条带的平均边缘强度。
 
@@ -408,10 +483,21 @@ def _edge_band_strength(
     在整数边界位置取 1px 宽条带求平均边缘强度，真实周期的边界带强度显著
     高于其子谐波（块内纹理周期 P/k 的条带大部分不与真实边界对齐）。
 
+    Task 6：``phases`` 参数提供相位感知覆盖。为 None 时用
+    ``_default_edge_band_phases`` 的默认相位集合（4 相位加密采样，
+    实测对子谐波/comb 回归无影响，故采纳为默认）。传入自定义相位
+    （如回退 {0, p/2}）可显式覆盖。
+
+    ``integral`` 为 ``em`` 的预构建积分图（``_build_integral`` 输出）：
+    提供时直接复用，避免每次调用重建整图积分图（大图下 O(H·W) 是热点）；
+    为 None 时内部构建（保持向后兼容，既有直接调用/测试不变）。
+
     Args:
         em: 边缘强度图 (H, W)，值域 [0,1]（``compute_edge_map`` 输出）。
         period: 候选周期（像素）。
         axis: 0=检测 y 方向周期（水平边界），1=检测 x 方向周期（垂直边界）。
+        phases: 显式相位集合（相对周期起点 offset，单位像素）；None 时用默认。
+        integral: ``em`` 的 (H+1, W+1) 积分图；None 时内部构建。
 
     Returns:
         边界带平均边缘强度。无法计算时返回 0.0。
@@ -423,11 +509,10 @@ def _edge_band_strength(
     p = float(period)
     if p < 1:
         return 0.0
-    # 积分图 O(1) 条带求和
-    I = np.zeros((H + 1, W + 1), dtype=np.float64)
-    I[1:, 1:] = np.cumsum(np.cumsum(em, axis=0), axis=1)
+    # 积分图 O(1) 条带求和；detect 主路径复用预构建积分图避免重复重建
+    I = integral if integral is not None else _build_integral(em)
     best = 0.0
-    for phase in (0.0, p / 2.0):
+    for phase in _default_edge_band_phases(p) if phases is None else tuple(phases):
         if axis == 1:  # x 方向：垂直边界（列条带）
             n = int((W - phase) // p)
             if n < 2:
@@ -528,6 +613,694 @@ def _comb_candidate_periods(
 # 限制相位扫描成本（大图 + 像素格点阵输入候选可达 20+，全量计算极慢）。
 VOTE_BVR_LIMIT = 10
 
+# Task 4：runs/GCD 整数尺度交叉验证判定常量
+RUNS_STRONG_HIT_RATE = 0.7    # runs 视为强证据的命中率下限
+RUNS_AGREE_REL = 0.2          # runs 与 vote 一致的相对差阈值
+RUNS_ADOPT_EDGE_RATIO = 0.9   # runs > vote（子谐波场景）采纳 runs 所需边界强度比
+RUNS_SHRINK_EDGE_RATIO = 1.3  # runs < vote 时缩小周期所需显式边界强度比
+
+# Task 5：高分辨率合理性门控常量
+PLAUSIBILITY_MIN_PERIOD = 3   # 周期 < 该值才触发门控（1-2px 生成纹理）
+PLAUSIBILITY_EDGE_RATIO = 1.3 # 采纳更大倍周期需其边界带显著更强（>1.0 防均匀格点阵）
+PLAUSIBILITY_MAX_STEPS = 6    # 链式放大的最大步数（2→4→8→…）
+
+# G3：峰值格点拟合周期精化常量
+PEAK_LATTICE_MIN_PEAKS = 4    # 参与拟合的最少峰数（不足直接回退投票值）
+PEAK_LATTICE_MAX_FITS = 20    # k 扫描的 minimize 调用数上限（防大图过慢）
+PEAK_LATTICE_ALPHA = 0.5      # 缺失格线比例的惩罚系数
+PEAK_LATTICE_MAX_J = 0.15     # 接受精化结果的最大目标值 J*
+PEAK_LATTICE_MAX_REL = 0.3    # 精化值相对投票值的最大相对偏移
+# G3 轴一致性防护：两轴精化后的相对分裂超过该值、且精化前两轴一致
+# （相对差 ≤ 5%）时判定拟合不可信，整体回退精化前投票值。正方形网格
+# 两轴投影来自同一格点结构，精化成功时两轴应几乎一致（合成 7.5px 图
+# 两轴同收敛 7.49/7.49）；单轴锁错格点时（image02：x 回退 20.0 /
+# y 精化 20.804，分裂 3.9%）两轴周期出现无法同时成立的分裂。
+PEAK_LATTICE_AXIS_GUARD_REL = 0.02
+PEAK_LATTICE_AXIS_ORIG_REL = 0.05  # 精化前两轴视为"一致"的相对差上限
+
+# G2：梳状能量集中度终审常量（连续 (pitch, phase) 梳状打分）
+COMB_ACCEPT_CONF = 0.35        # 终审采纳置信度阈值（低于则保持投票链结果）
+COMB_COARSE_REL_STEP = 0.02    # 粗扫 pitch 相对步长（~2%，[3,40] 约 131 个候选）
+COMB_PHASE_COARSE_STEP = 0.5   # 粗扫/细网格相位步长（px）
+COMB_SEG_PERIODS = 3           # 分段粗扫每段周期数（段内 2% 网格误差残余漂移 <0.5px）
+COMB_SEG_MIN_LEN = 24          # 分段粗扫最小段长（px，小周期至少 ~8 齿定相）
+COMB_TOPK_EXCL_REL = 0.08      # 贪心 top-K 去重窗口（≥ 分段平台宽度 ~±4%）
+COMB_REFINE_TOP_K = 3          # 精化候选数（粗扫分数前 K 个不同峰）
+COMB_FINE_RANGE = 0.06         # 细 pitch 网格半范围（±6%，覆盖分段平台 ±4%）
+COMB_FINE_STEP_FACTOR = 0.8    # 细网格步长 = 0.8·p/n（保证落入精确盆地）
+COMB_FINE_CHUNK = 128          # 细网格分块大小（防大图张量过大）
+COMB_REFINE_ROUNDS = 8         # 精化抛光轮数（步长逐轮折半）
+COMB_PITCH_STEP_FLOOR = 0.002  # pitch 精化步长下限（px）
+COMB_PHASE_STEP_FLOOR = 0.1    # 相位精化步长下限（px）
+COMB_TIE_DIVISOR = 1.15        # 平局集判定：分数 ≥ best/1.15（≈0.87×best）
+COMB_REFINE_CONSISTENCY = 0.5  # 精化/粗扫一致性下限（低于视为分段平台噪声剔除）
+COMB_INT_SNAP_RATIO = 0.97     # 整数吸附：整数 pitch 分数 ≥ 0.97×best_score
+COMB_FAMILY_REL = 0.05         # 同族判定：相对差 <5%
+COMB_FAMILY_INT_TOL = 0.02     # 同族判定：整数倍/小整数比关系容差（相对）
+COMB_FAMILY_MAX_RATIO = 4      # 同族判定：小整数比 k/j 的分子分母上限（k,j ≤ 4）
+COMB_MIN_PROFILE_MULT = 4      # profile 长度 < 4×min_p 时拒绝终审
+
+# --- JPEG 8×8 压缩网格检测（G5，IPOL 2020 交叉差分法的简化实现）---
+JPEG_GRID_MIN_SIZE = 32        # detect_jpeg_grid 输入最小边长（过小无统计意义）
+JPEG_GRID_QUANTILE = 90.0      # 交叉差分响应参与投票的分位（仅强响应投票）
+# 显著性阈值：峰 bin 占比。均匀期望 1/64≈0.0156；校准（合成 12px 网格 +
+# 噪声图）：JPEG q=60-75 重载 strength≈0.082-0.111，PNG 无损对照≈0.021-0.030，
+# 真实测试图（含 image02.png 的 8 对齐内容网格）≤0.057，取 0.06 兼顾两侧裕量
+JPEG_GRID_STRENGTH_THRESHOLD = 0.06
+JPEG_PENALTY_FACTOR = 0.6      # JPEG 网格候选的边界强度降权因子
+# 受惩罚候选：8/16/24 的 ±1 邻域（JPEG 压缩伪影周期及其邻近整数候选）
+JPEG_PENALTY_PERIODS = frozenset({7, 8, 9, 15, 16, 17, 23, 24, 25})
+
+
+def _runs_correct_period(
+    period: float,
+    vote: float,
+    runs: float,
+    edge_map: np.ndarray,
+    axis: int,
+    min_p: int,
+    max_p: int,
+    edge_integral: np.ndarray | None = None,
+) -> float:
+    """runs/GCD 整数尺度对单方向周期的交叉验证修正。
+
+    仅在 runs 证据强（detect 中已校验命中率/一致性）时调用：
+    - 一致（相对差 ≤ RUNS_AGREE_REL）：周期吸附为整数 runs；
+    - runs > vote 且 runs ≈ k*vote（k≥2）且 edge(runs) ≥ 0.9*edge(vote)：
+      投票误检子谐波，采纳 runs（runs 指示真实大块）；
+    - runs < vote：默认不缩小周期（防把真实块缩成块内纹理周期，如
+      28px 块 + 7px 纹理场景 runs=7 < vote=28），除非 period ≥ 3 且
+      edge(runs) > 1.3*edge(vote) 的显式边界强度证据。
+
+    Args:
+        period: 当前周期（FFT 或被投票覆盖后的值）。
+        vote: 投票得出的周期（vote_px / vote_py）。
+        runs: runs/GCD 检测的整数尺度。
+        edge_map: 边缘强度图 (H, W)。
+        axis: 0=检测 y 方向周期，1=检测 x 方向周期。
+        min_p: 最小候选周期。
+        max_p: 最大候选周期。
+        edge_integral: ``edge_map`` 的 (H+1, W+1) 积分图；None 时内部构建。
+
+    Returns:
+        修正后的周期。无修正条件满足时返回原 ``period``。
+    """
+    if period <= 0 or vote <= 0 or runs <= 0:
+        return period
+    v = float(vote)
+    r = float(runs)
+    rel = abs(r - v) / max(r, v)
+    if rel <= RUNS_AGREE_REL:
+        # 一致：吸附为整数尺度
+        return r
+    if r > v:
+        ratio = r / v
+        k = round(ratio)
+        if k >= 2 and abs(ratio - k) / k <= 0.15:
+            e_runs = _edge_band_strength(edge_map, r, axis=axis, integral=edge_integral)
+            e_vote = _edge_band_strength(edge_map, v, axis=axis, integral=edge_integral)
+            if e_runs >= RUNS_ADOPT_EDGE_RATIO * e_vote:
+                return r
+        return period
+    # runs < vote：默认不缩小周期
+    if v >= 3:
+        e_runs = _edge_band_strength(edge_map, r, axis=axis, integral=edge_integral)
+        e_vote = _edge_band_strength(edge_map, v, axis=axis, integral=edge_integral)
+        if e_vote > 1e-12 and e_runs > RUNS_SHRINK_EDGE_RATIO * e_vote:
+            return r
+    return period
+
+
+def _plausibility_gate_axis(
+    p: float,
+    edge_map: np.ndarray,
+    axis: int,
+    min_p: int,
+    max_p: int,
+    edge_integral: np.ndarray | None = None,
+) -> float:
+    """高分辨率合理性门控（单轴）：小周期若为块内纹理则放大到真实块周期。
+
+    候选周期过小（< PLAUSIBILITY_MIN_PERIOD）时，检查其整数倍 k*p
+    （k=2..，直至超出 [min_p, max_p]）的边界带边缘强度，若某倍周期
+    显著更强（≥ PLAUSIBILITY_EDGE_RATIO），说明小周期是块内纹理而非
+    网格边界，采纳该更大周期并链式继续放大（2→16→…）直到边界带不再增强。
+
+    ``PLAUSIBILITY_EDGE_RATIO`` 取值依据：真实 1-2px 格点阵的各整数倍
+    边界带比值 ≈1.0-1.15（相位采样总能命中边界线），而「块内 2px 纹理 +
+    大块网格」场景中大倍周期命中真实块边界，比值可达 1.3-1.6。阈值取 1.3
+    在两者之间留有安全间隔：0.8 会把均匀 2px 格点阵误放大到 4（红线：
+    真实 2px 网格必须仍检出 2），故不采用任务建议的 0.8。
+
+    Args:
+        p: 当前周期（像素）。
+        edge_map: 边缘强度图 (H, W)。
+        axis: 0=检测 y 方向周期，1=检测 x 方向周期。
+        min_p: 最小候选周期。
+        max_p: 最大候选周期。
+        edge_integral: ``edge_map`` 的 (H+1, W+1) 积分图；None 时内部构建。
+
+    Returns:
+        门控后的周期。
+    """
+    cur = float(p)
+    # 仅当周期过小（< PLAUSIBILITY_MIN_PERIOD，如 1-2px 生成纹理）时触发门控；
+    # 周期已合理时不放大到其整数倍，防把正常网格误放大。
+    if cur >= PLAUSIBILITY_MIN_PERIOD:
+        return cur
+    for _ in range(PLAUSIBILITY_MAX_STEPS):
+        e_cur = _edge_band_strength(edge_map, cur, axis=axis, integral=edge_integral)
+        if e_cur <= 1e-12:
+            break
+        next_p = cur
+        # 检查 k=2.. 的倍周期，取第一个边界带显著更强的（链式继续）
+        k_max = min(int(max_p // cur) + 1, 13)  # 限制检查倍数，防性能退化
+        for k in range(2, k_max):
+            kp = k * cur
+            if kp < min_p or kp > max_p:
+                continue
+            e_kp = _edge_band_strength(edge_map, kp, axis=axis, integral=edge_integral)
+            if e_kp >= PLAUSIBILITY_EDGE_RATIO * e_cur:
+                next_p = kp
+                break
+        if next_p == cur:
+            break
+        cur = next_p
+    return cur
+
+
+def _refine_period_peak_lattice(
+    profile: np.ndarray,
+    initial_p: float,
+    min_p: float,
+    max_p: float,
+) -> float:
+    """峰值格点拟合周期精化（G3）。
+
+    投票/runs 交叉验证输出的周期常为整数或粗估值，真实块周期常为
+    非整数（如 7.45px）。参考 Pixel-Extractor 的峰值格点拟合范式：把
+    投影信号的峰视为格线采样，拟合格点间距 s 使 ``峰间距 ≈ round(峰间距/s)·s``
+    的残差最小，从而把周期精化为浮点值。
+
+    流程：
+    1. ``find_peaks`` 按 prominence 找峰（阈值 0.05×max 起步，峰数 <4 时
+       逐级放宽到 0.02/0.01；仍 <4 峰直接回退 ``initial_p``）；
+    2. 峰按 prominence 降序排序，对 k = 4..len(peaks)（峰数多时跳采样，
+       限制 minimize 调用数保证单次调用 <50ms）：取前 k 峰按位置升序，
+       间距 ``spacings = np.diff(positions)``；
+    3. 对每个 k 用 L-BFGS-B 最小化
+       ``J(s) = sqrt(mean((spacings − round(spacings/s)·s)²))/s
+       + α·missing_ratio``，其中 missing_ratio 为首末峰间缺失格线比例
+       （惩罚子谐波：s 减半时一半格线无峰），α≈0.5；初值 ``initial_p``，
+       bounds=[min_p, max_p]；
+    4. 取所有 k 中 J 最小者为 (s*, J*)；接受准则 ``J* < 0.15`` 且
+       ``|s* − initial_p|/initial_p ≤ 0.3``，否则回退 ``initial_p``；
+    5. 整数吸附（可选规则，已采纳）：若 ``|s*−initial_p|/initial_p ≤ 0.02``
+       且 ``|s* − round(s*)| < 0.02·s*``，返回 ``round(s*)``——投票值与
+       拟合值双重一致且拟合值贴近整数时判定为干净整数网格，吸附保持
+       位精确；两条件同时收紧到 2% 以降低把真实非整数周期（如 7.9px）
+       误吸附为整数的风险。
+
+    Args:
+        profile: 1D 投影信号（sig_x 或 sig_y）。
+        initial_p: 投票得出的初始周期（>0 时才精化）。
+        min_p: 周期下界（拟合 bounds）。
+        max_p: 周期上界（拟合 bounds）。
+
+    Returns:
+        精化后的周期；峰不足/拟合失败/偏移过大时回退 ``initial_p``。
+    """
+    from scipy.optimize import minimize
+    from scipy.signal import find_peaks
+
+    prof = np.asarray(profile, dtype=np.float64)
+    p0 = float(initial_p)
+    if p0 <= 0 or prof.size < 8:
+        return p0
+    prof_max = float(prof.max())
+    if prof_max <= 1e-12:
+        return p0
+    # 峰检测：prominence 阈值从 0.05×max 起步逐级放宽，保证典型网格图峰数 ≥4。
+    # 起步值低于建议的 0.1：真实图（如 image02）约四成边界峰 prominence 在
+    # 0.05-0.1×max 之间，0.1 起步会漏掉它们使 missing_ratio 惩罚超标、
+    # 正确周期被拒（实测 0.1 起步时 image02 仅 y 方向精化成功）。
+    peak_idx = None
+    peak_prom = None
+    for prom_ratio in (0.05, 0.02, 0.01):
+        idx, props = find_peaks(prof, prominence=prom_ratio * prof_max)
+        if idx.size >= PEAK_LATTICE_MIN_PEAKS:
+            peak_idx = idx
+            peak_prom = props["prominences"]
+            break
+    if peak_idx is None:
+        return p0
+    # 峰按 prominence 降序：前 k 峰构成候选子集（强峰优先，抗弱边界缺失）
+    order = np.argsort(-peak_prom, kind="stable")
+    pos_by_prom = peak_idx[order].astype(np.float64)
+    n_peaks = int(pos_by_prom.size)
+
+    # k 扫描序列：4..n_peaks；峰数多时跳采样（minimize 调用数有上限），
+    # 但始终包含 n_peaks（全峰拟合对真周期 missing=0，是最重要的 k）
+    if n_peaks <= PEAK_LATTICE_MAX_FITS + 4:
+        ks: list[int] = list(range(PEAK_LATTICE_MIN_PEAKS, n_peaks + 1))
+    else:
+        head = list(range(PEAK_LATTICE_MIN_PEAKS, 15))
+        stride = max(2, (n_peaks - 14) // (PEAK_LATTICE_MAX_FITS - len(head)))
+        tail = list(range(15, n_peaks, stride))
+        ks = head + tail + [n_peaks]
+
+    best_s = None
+    best_j = np.inf
+    for k in ks:
+        if k > n_peaks:
+            continue
+        pos = np.sort(pos_by_prom[:k])
+        spacings = np.diff(pos)
+        if spacings.size < PEAK_LATTICE_MIN_PEAKS - 1:
+            continue
+        first = float(pos[0])
+        last = float(pos[-1])
+
+        def _obj_jac(
+            s: np.ndarray, _sp=spacings, _k=k, _first=first, _last=last
+        ) -> tuple[float, np.ndarray]:
+            """目标值与解析梯度（missing 为阶梯函数，区间内梯度取 0）。"""
+            sv = float(np.asarray(s).ravel()[0])
+            if sv <= 0:
+                return (1e9, np.array([0.0]))
+            # 相邻峰至少跨 1 条格线（round 下限 1，防 0 格退化放大残差）
+            r = np.maximum(np.round(_sp / sv), 1.0)
+            resid = _sp - r * sv
+            ms = float(np.mean(resid * resid))
+            rms = float(np.sqrt(ms)) / sv
+            # 首末峰间缺失格线比例：惩罚"格线应有峰却无峰"的子谐波解
+            n_lines = int(round((_last - _first) / sv)) + 1
+            if n_lines < _k:
+                n_lines = _k
+            missing = max(0.0, (n_lines - _k) / n_lines)
+            # d(rms)/ds = mean(resid·(-r))/(s·sqrt(ms)) − sqrt(ms)/s²
+            if ms > 1e-24:
+                grad = (float(np.mean(resid * (-r))) / (sv * np.sqrt(ms))
+                        - np.sqrt(ms) / (sv * sv))
+            else:
+                grad = 0.0
+            return (rms + PEAK_LATTICE_ALPHA * missing, np.array([grad]))
+
+        try:
+            res = minimize(
+                _obj_jac, x0=np.array([p0]), jac=True, method="L-BFGS-B",
+                bounds=[(float(min_p), float(max_p))],
+            )
+        except Exception:
+            continue
+        if res.fun < best_j:
+            best_j = float(res.fun)
+            best_s = float(res.x[0])
+
+    if best_s is None or best_j >= PEAK_LATTICE_MAX_J:
+        return p0
+    # 安全阀：精化值相对投票值偏移过大视为不可信（可能锁到子/超谐波）
+    if abs(best_s - p0) / p0 > PEAK_LATTICE_MAX_REL:
+        return p0
+    # 整数吸附：双证据（与投票值一致 ≤2% 且贴近整数 <2%·s*）时吸附
+    if (abs(best_s - p0) / p0 <= 0.02
+            and abs(best_s - round(best_s)) < 0.02 * best_s):
+        return float(round(best_s))
+    return best_s
+
+
+def _comb_energy_score(profile: np.ndarray, pitch: float, phase: float) -> float:
+    """梳状能量集中度得分（G2 终审裁决的核心判据）。
+
+    以 (pitch, phase) 定义梳齿位置 ``pos_k = round(phase + k·pitch)``
+    （k = 0..⌊(len−1−phase)/pitch⌋，仅保留 0 ≤ pos < len 的齿），每齿
+    1px 采样捕获能量 ``E = Σ profile[pos_k]``，得分为::
+
+        score = E / total_energy − n_teeth / n_positions
+
+    惩罚项 ``n_teeth/n`` 是随机取位的期望能量占比，故 score > 0 表示梳
+    齿对齐位置的能量密度高于随机基线。真周期 P 命中全部边界能量且齿数
+    最少；子谐波 P/2 以双倍齿数仅多捕获块内噪声（惩罚翻倍必然更低分），
+    倍频 2P 漏一半边界（能量减半），数学上均严格低于真周期——不依赖
+    经验阈值，原理性压制投票链的子谐波/倍频误检。
+
+    Args:
+        profile: 1D 投影信号（建议先做 σ≈0.5 轻高斯平滑以容忍 AA 相位
+            散布；平滑应由调用方做一次并缓存，不在本函数内重复）。
+        pitch: 梳齿间距（候选周期，像素）。
+        phase: 首齿相位（像素）。
+
+    Returns:
+        得分（< 1，可略为负）。pitch ≤ 0、无有效齿或总能量 ≈ 0 时
+        返回 0.0。
+    """
+    prof = np.asarray(profile, dtype=np.float64)
+    n = int(prof.size)
+    p = float(pitch)
+    ph = float(phase)
+    if n == 0 or p <= 0:
+        return 0.0
+    k_max = int(np.floor((n - 1 - ph) / p))
+    if k_max < 0:
+        return 0.0
+    pos = np.rint(ph + np.arange(k_max + 1, dtype=np.float64) * p).astype(np.int64)
+    pos = pos[(pos >= 0) & (pos < n)]
+    if pos.size == 0:
+        return 0.0
+    total = float(prof.sum())
+    if total <= 1e-12:
+        return 0.0
+    e = float(prof[pos].sum())
+    return e / total - pos.size / n
+
+
+def _comb_same_family(p_a: float, p_b: float) -> bool:
+    """判断两个候选周期是否属同一谐波家族（G2 separation 的同族判定）。
+
+    同族 = 相对差 < COMB_FAMILY_REL（同一峰的粗扫邻域）或小整数比关系
+    hi/lo ≈ k/j（k, j ≤ COMB_FAMILY_MAX_RATIO，容差 COMB_FAMILY_INT_TOL），
+    涵盖 P 与 2P/3P/4P/P/2 等整数倍及 3/2、4/3 等有理数倍（共享同一
+    格点格子的不同子采样密度）。同族候选视为同一周期假设的不同表述，
+    不参与次优非同族竞争。
+
+    Args:
+        p_a: 候选周期 A。
+        p_b: 候选周期 B。
+
+    Returns:
+        是否同族。非正值输入视为同族（不构成有效竞争者）。
+    """
+    lo, hi = (float(p_a), float(p_b)) if p_a <= p_b else (float(p_b), float(p_a))
+    if hi <= 0:
+        return True
+    if (hi - lo) / hi < COMB_FAMILY_REL:
+        return True
+    if lo <= 0:
+        return False
+    ratio = hi / lo
+    # 小整数比 k/j（含整数倍 k/1）：如 2、3、4、3/2、4/3 及其倒数
+    for j in range(1, COMB_FAMILY_MAX_RATIO + 1):
+        for k in range(j + 1, COMB_FAMILY_MAX_RATIO + 1):
+            r = k / j
+            if abs(ratio - r) / r < COMB_FAMILY_INT_TOL:
+                return True
+    return False
+
+
+def _comb_fine_grid_search(
+    prof_s: np.ndarray, total: float, pitch0: float, min_p: float, max_p: float
+) -> tuple[float, float, float]:
+    """细 pitch 网格 × 全相位扫描（精确全局分数），返回 (pitch, phase, score)。
+
+    分段粗扫只能把候选定位到家族平台（半宽 ~1/(3p) ≈ ±4%），而精确全局
+    分数的"盆地"（全部齿命中，齿漂移 <0.5px）宽度仅 ~p/n——从平台边缘
+    做步长折半会被平台内的对角线伪对齐脊线（pitch 略偏 + 相位漂移扫过
+    峰列）困住（实测合成 16px 信号从 15.83 出发卡死在 15.94/相位 1.4）。
+    本函数在 ±COMB_FINE_RANGE 内以步长 ``COMB_FINE_STEP_FACTOR·p/n``
+    （保证网格点距真周期 ≤0.4·p/n，落入盆地）扫 pitch，每个 pitch 全
+    相位（0.5px）向量化打分，取全局最优。张量 (F, n_ph, K) 按块计算防
+    大图内存超标。
+    """
+    n = int(prof_s.size)
+    p_lo = max(pitch0 * (1.0 - COMB_FINE_RANGE), min_p)
+    p_hi = min(pitch0 * (1.0 + COMB_FINE_RANGE), max_p)
+    if p_hi < p_lo:
+        p_hi = p_lo
+    step = max(COMB_FINE_STEP_FACTOR * pitch0 / n, 1e-4)
+    n_steps = int(np.ceil((p_hi - p_lo) / step)) + 1
+    pf = np.linspace(p_lo, p_hi, n_steps)
+    n_ph = int(np.ceil(p_hi / COMB_PHASE_COARSE_STEP - 1e-9))
+    phases = np.arange(n_ph) * COMB_PHASE_COARSE_STEP
+    k_max = int(np.floor((n - 1) / max(p_lo, 1e-6))) + 1
+    ks = np.arange(k_max, dtype=np.float64)
+    best = (float(pf[0]), 0.0, -np.inf)
+    for c0 in range(0, n_steps, COMB_FINE_CHUNK):
+        pf_c = pf[c0:c0 + COMB_FINE_CHUNK]
+        # 位置张量 (F_c, n_ph, K)：pitch_s + phase_j + m·pitch_s
+        pos = pf_c[:, None, None] + phases[None, :, None] + ks[None, None, :] * pf_c[:, None, None]
+        pos_r = np.rint(pos).astype(np.int64)
+        valid = (pos_r >= 0) & (pos_r < n)
+        idx = np.where(valid, pos_r, 0)
+        vals = np.where(valid, prof_s[idx], 0.0)
+        e = vals.sum(axis=2)          # (F_c, n_ph)
+        nt = valid.sum(axis=2)
+        scores = e / total - nt / n
+        j_flat = int(np.argmax(scores))
+        fi, j = np.unravel_index(j_flat, scores.shape)
+        if float(scores[fi, j]) > best[2]:
+            best = (float(pf_c[fi]), float(phases[j]), float(scores[fi, j]))
+    return best
+
+
+def _comb_seg_coarse_score(
+    prof_s: np.ndarray, total: float, pitch: float
+) -> float:
+    """分段最优相位粗扫分数（对 2% 网格的齿漂移免疫）。
+
+    单相位全局打分在粗扫 pitch 误差 ε 下齿位置漂移 ε·n px（n=512、
+    ε=2% 时漂移 10px），真周期的粗扫分数被系统性压低、排名由网格幸运
+    落点决定（实测合成 16px 周期信号：全局粗扫 top-1 是 16/3 的幸运
+    网格点，真 16 附近仅 0.14 vs 精确值 0.67）。改为把 profile 切成
+    ~COMB_SEG_PERIODS 个周期长的段，每段独立扫相位取最优，段内残余
+    漂移仅 ε·L_seg/2 ≈ 0.3px < 0.5px——真周期在任何网格落点下都得到
+    接近精确的全局分数，排名稳定；段间累积漂移被每段重新定相吸收。
+
+    每段贡献 ``E_seg/total − n_teeth_seg/n``（与全局分数同量纲），粗扫
+    分数 = Σ 段内最优。位置张量 (S, n_ph, M) 一次性 gather+sum。
+
+    Args:
+        prof_s: 平滑后的 1D 投影信号。
+        total: ``prof_s`` 的总能量。
+        pitch: 候选周期。
+
+    Returns:
+        分段粗扫分数。
+    """
+    n = int(prof_s.size)
+    l_seg = max(COMB_SEG_PERIODS * pitch, float(COMB_SEG_MIN_LEN))
+    n_seg = max(1, int(np.ceil(n / l_seg)))
+    seg_starts = np.arange(n_seg) * l_seg
+    seg_ends = np.minimum(seg_starts + l_seg, float(n))
+    n_ph = int(np.ceil(pitch / COMB_PHASE_COARSE_STEP - 1e-9))
+    phases = np.arange(n_ph) * COMB_PHASE_COARSE_STEP
+    m_max = int(np.ceil(l_seg / pitch)) + 1
+    ms = np.arange(m_max, dtype=np.float64)
+    # 位置张量 (S, n_ph, M)：seg_start + phase + m·pitch
+    pos_r = np.rint(
+        seg_starts[:, None, None] + phases[None, :, None] + ms[None, None, :] * pitch
+    ).astype(np.int64)
+    lo = seg_starts[:, None, None]
+    hi = seg_ends[:, None, None]
+    valid = (pos_r >= lo) & (pos_r < hi) & (pos_r >= 0) & (pos_r < n)
+    idx = np.where(valid, pos_r, 0)
+    vals = np.where(valid, prof_s[idx], 0.0)
+    e = vals.sum(axis=2)          # (S, n_ph)
+    n_teeth = valid.sum(axis=2)   # (S, n_ph)
+    seg_scores = e / total - n_teeth / n
+    return float(seg_scores.max(axis=1).sum())
+
+
+def _comb_best_period(
+    profile: np.ndarray, min_p: int, max_p: int
+) -> tuple[float, float, float]:
+    """梳状能量集中度周期搜索（G2 终审裁决）。
+
+    对 σ=0.5 轻高斯平滑（本函数内做一次并缓存，粗扫/精化共用）后的
+    投影信号在 [min_p, max_p] 上做连续 (pitch, phase) 梳状打分搜索：
+
+    1. 粗扫（定位家族）：pitch 以 ~2% 相对步长递增（[3,40] 约 131 个
+       候选），每 pitch 做**分段最优相位**打分（``_comb_seg_coarse_score``，
+       段长 ~3 周期、相位 0.5px、位置张量向量化）——单相位全局打分在
+       2% 网格误差下齿漂移 ε·n px 会把真周期分数压低一个量级（排名由
+       网格幸运落点决定），分段重新定相使排名对网格落点免疫；
+    2. 精化（定位精确 pitch）：粗扫分数前 3 个不同峰（贪心去重，窗口
+       8% ≥ 分段平台宽 ±4%）各自做**细 pitch 网格 × 全相位扫描**
+       （``_comb_fine_grid_search``，±6%、步长 0.8·p/n 保证落入精确
+       全局分数的盆地），再做步长折半 3×3 局部抛光（8 轮，pitch 到
+       ~0.002px、相位到 0.1px）；精化分数低于自身粗扫分数 50% 的候选
+       判为分段平台噪声（局部可对齐但全局不相干），从裁决池剔除；
+    3. 裁决：平局集（分数 ≥ best/1.15）中取最大 pitch——谐波家族中
+       最大竞争者即真值，防 p/2、p/3 子谐波因微小分数差胜出；整数吸附
+       （round(pitch) 的分数 ≥ 0.97×best 时吸附为整数，干净整数网格
+       保持位精确）；confidence = quality × separation，其中 quality =
+       clamp(best_score, 0, 1)（能量集中度本身），separation =
+       (best − 次优非同族分数)/best（同族见 ``_comb_same_family``，
+       无次优非同族时为 1）。
+
+    Args:
+        profile: 1D 投影信号（sig_x / sig_y）。
+        min_p: 周期下界（≥1）。
+        max_p: 周期上界。
+
+    Returns:
+        (best_pitch, best_phase, confidence)。profile 过短（< 4×min_p）、
+        参数非法或总能量 ≈ 0 时返回 (0.0, 0.0, 0.0)。
+    """
+    prof = np.asarray(profile, dtype=np.float64)
+    n = int(prof.size)
+    if min_p < 1 or max_p < min_p:
+        return (0.0, 0.0, 0.0)
+    if n < COMB_MIN_PROFILE_MULT * int(min_p) or n < 8:
+        return (0.0, 0.0, 0.0)
+    # σ=0.5 轻高斯平滑（只做一次）：容忍 AA/取整造成的 ±1px 相位散布
+    from scipy.ndimage import gaussian_filter1d
+
+    prof_s = gaussian_filter1d(prof, sigma=0.5, mode="nearest")
+    total = float(prof_s.sum())
+    if total <= 1e-12:
+        return (0.0, 0.0, 0.0)
+
+    # --- 粗扫：pitch ~2% 相对步长；分段最优相位（漂移免疫）向量化打分 ---
+    pitches: list[float] = []
+    p = float(min_p)
+    while p <= float(max_p) + 1e-9:
+        pitches.append(p)
+        p *= 1.0 + COMB_COARSE_REL_STEP
+    if not pitches:
+        return (0.0, 0.0, 0.0)
+    coarse_score = np.array(
+        [_comb_seg_coarse_score(prof_s, total, pi) for pi in pitches],
+        dtype=np.float64,
+    )
+
+    # --- 精化候选：粗扫分数降序贪心选前 K 个不同峰 ---
+    # 去重窗口取 COMB_TOPK_EXCL_REL（8%，≥ 分段平台宽度 ±4%）：分段打分
+    # 对 pitch 误差不敏感，同一家族平台（±4%）内的粗扫点分数几乎相同，
+    # 5% 窗口会让同一峰的多个平台点占满 top-K 名额。
+    order = np.argsort(-coarse_score, kind="stable")
+    picked: list[int] = []
+    for idx in order:
+        idx = int(idx)
+        pi = pitches[idx]
+        if any(
+            abs(pi - pitches[q]) / max(pi, pitches[q]) < COMB_TOPK_EXCL_REL
+            for q in picked
+        ):
+            continue
+        picked.append(idx)
+        if len(picked) >= COMB_REFINE_TOP_K:
+            break
+    if not picked:
+        return (0.0, 0.0, 0.0)
+
+    # --- 精化：细 pitch 网格 × 全相位扫描（精确全局分数）+ 步长折半抛光 ---
+    refined: list[tuple[float, float, float]] = []
+    for idx in picked:
+        p_cur, ph_cur, s_cur = _comb_fine_grid_search(
+            prof_s, total, pitches[idx], float(min_p), float(max_p)
+        )
+        # 步长折半抛光：细网格已落入精确盆地（pitch 误差 ≤0.4·p/n），此处
+        # 仅在盆地内做 3×3 局部搜索微调相位/边界齿数（规格的折半结构）
+        dp = max(2.0 * COMB_FINE_STEP_FACTOR * p_cur / n, COMB_PITCH_STEP_FLOOR)
+        dph = COMB_PHASE_COARSE_STEP * 0.5
+        for _ in range(COMB_REFINE_ROUNDS):
+            best_p, best_ph, best_s = p_cur, ph_cur, s_cur
+            for p_cand in (p_cur - dp, p_cur, p_cur + dp):
+                if p_cand < float(min_p) or p_cand > float(max_p):
+                    continue
+                for ph_cand in (ph_cur - dph, ph_cur, ph_cur + dph):
+                    ph_w = ph_cand % p_cand  # 相位回卷到 [0, pitch)
+                    s_cand = _comb_energy_score(prof_s, p_cand, ph_w)
+                    if s_cand > best_s:
+                        best_p, best_ph, best_s = p_cand, ph_w, s_cand
+            p_cur, ph_cur, s_cur = best_p, best_ph, best_s
+            dp = max(dp * 0.5, COMB_PITCH_STEP_FLOOR)
+            dph = max(dph * 0.5, COMB_PHASE_STEP_FLOOR)
+        # 一致性过滤：精化分数远低于自身分段粗扫分数（<50%）说明细网格
+        # 未在该粗扫点附近找到全局相干盆地——该候选只是分段平台的噪声
+        # （实测干净 7.5 网格 sig_x 的 6.89 粗扫点：分段分 0.39、精化仅
+        # 0.12），作为周期假设不成立，从裁决池剔除，防其拉低 separation
+        if s_cur >= COMB_REFINE_CONSISTENCY * float(coarse_score[idx]):
+            refined.append((p_cur, ph_cur, s_cur))
+    if not refined:
+        return (0.0, 0.0, 0.0)
+
+    # --- 裁决：平局集取最大 pitch + 整数吸附 + quality×separation 置信度 ---
+    best = max(refined, key=lambda t: t[2])
+    tie = [t for t in refined if t[2] >= best[2] / COMB_TIE_DIVISOR]
+    sel = max(tie, key=lambda t: t[0])
+    best_pitch, best_phase, best_score = sel
+    # 整数吸附：round(pitch) 分数 ≥ 0.97×best 时吸附（干净整数网格位精确）
+    p_int = float(round(best_pitch))
+    if float(min_p) <= p_int <= float(max_p):
+        s_int = _comb_energy_score(prof_s, p_int, best_phase % p_int)
+        if s_int >= COMB_INT_SNAP_RATIO * best_score:
+            best_pitch = p_int
+            best_score = s_int
+    # separation：次优非同族分数（精化候选池，排除被选中者）
+    second = None
+    for t in refined:
+        if t is sel:
+            continue
+        if _comb_same_family(best_pitch, t[0]):
+            continue
+        if second is None or t[2] > second:
+            second = t[2]
+    quality = min(max(best_score, 0.0), 1.0)
+    if second is None:
+        separation = 1.0
+    else:
+        separation = (best_score - second) / max(abs(best_score), 1e-9)
+        separation = min(max(separation, 0.0), 1.0)
+    conf = quality * separation
+    return (float(best_pitch), float(best_phase), float(conf))
+
+
+def detect_jpeg_grid(
+    gray: np.ndarray, strength_threshold: float = JPEG_GRID_STRENGTH_THRESHOLD
+) -> tuple[bool, tuple[int, int], float]:
+    """检测 JPEG 8×8 压缩网格（G5，参考 IPOL 2020 交叉差分法）。
+
+    原理：交叉差分 ``C(x,y) = I(x+1,y+1) − I(x+1,y) − I(x,y+1) + I(x,y)``
+    的一阶差分（真实内容边缘）被成对相减抵消，仅保留量化阶跃在横纵边界
+    交汇处（JPEG 块角点）产生的混合二阶差分响应。JPEG 网格的显著特征是
+    全部块角点 mod 8 后落入同一相位 bin（网格相位固定），而自然图像的强
+    响应位置 mod 8 近似均匀铺满 64 个 bin。
+
+    对 64 个可能网格原点 ``(py, px) ∈ {0..7}²`` 投票：只取响应强的位置
+    （|C| 超过其 90 分位）参与投票，投给 bin ``(y mod 8, x mod 8)``，
+    64 bins 直方图归一化后取峰 bin 占比为 strength。
+
+    Args:
+        gray: 灰度图数组 (H, W)。
+        strength_threshold: 显著性阈值（峰 bin 占比）。均匀期望 1/64≈0.0156；
+            默认 0.06（约均匀的 3.8 倍），经合成测试校准：12px 网格+噪声图
+            PIL JPEG q=70 保存重载 strength≈0.08-0.11（显著），同一图 PNG
+            无损保存重载≈0.02-0.03（不显著）。
+
+    Returns:
+        (is_significant, phase, strength)：是否显著、峰 bin 相位 ``(py, px)``
+        （各分量 0-7）、峰 bin 占比。输入过小（<32px）、全零差分或强响应
+        样本不足时返回 ``(False, (0, 0), 0.0)``。
+    """
+    arr = np.asarray(gray, dtype=np.float64)
+    if arr.ndim != 2:
+        return (False, (0, 0), 0.0)
+    H, W = arr.shape
+    if H < JPEG_GRID_MIN_SIZE or W < JPEG_GRID_MIN_SIZE:
+        return (False, (0, 0), 0.0)
+    # 交叉差分（float64，全向量化：4 次移位相减）
+    c = arr[1:, 1:] - arr[:-1, 1:] - arr[1:, :-1] + arr[:-1, :-1]
+    abs_c = np.abs(c)
+    # 仅强响应位置参与投票：JPEG 块角点是稀疏强响应源，弱响应以噪声为主、
+    # 均匀铺满 64 bins 会稀释相位峰（90 分位 ≈ 前 10% 位置）
+    thr = float(np.percentile(abs_c, JPEG_GRID_QUANTILE))
+    if thr <= 1e-12:
+        # 全零差分（常数图）或 90 分位以下无响应：无网格证据
+        return (False, (0, 0), 0.0)
+    ys, xs = np.nonzero(abs_c > thr)
+    if ys.size < 64:
+        # 强响应样本过少，相位直方图无统计意义
+        return (False, (0, 0), 0.0)
+    # 投票：强响应位置 (y, x) 投给网格原点 bin (y mod 8, x mod 8)
+    bins = (ys % 8) * 8 + (xs % 8)
+    hist = np.bincount(bins, minlength=64).astype(np.float64)
+    hist /= float(ys.size)
+    idx = int(np.argmax(hist))
+    strength = float(hist[idx])
+    phase = (idx // 8, idx % 8)
+    return (bool(strength >= strength_threshold), phase, strength)
+
 
 def _vote_period(
     gray: np.ndarray,
@@ -538,6 +1311,10 @@ def _vote_period(
     edge_map: np.ndarray | None = None,
     comb_weight: float = 0.0,
     use_comb_prefilter: bool = False,
+    edge_integral: np.ndarray | None = None,
+    gray_integral: np.ndarray | None = None,
+    gray_integral_sq: np.ndarray | None = None,
+    jpeg_penalty: bool = False,
 ) -> tuple[float, float]:
     """多判据投票选最佳周期，返回 (period, confidence)。
 
@@ -552,6 +1329,18 @@ def _vote_period(
       ``use_comb_prefilter`` 时修正还需 Spectral Comb 一致性
       （comb(kP) > 1.2*comb(P)），规则细线纹理（comb 高、边界弱）被边界门控拦截。
 
+    ``edge_integral`` / ``gray_integral`` / ``gray_integral_sq`` 为预构建积分图
+    （``_build_integral`` 输出），供内部 ``_edge_band_strength`` 与
+    ``_block_variance_ratio`` 复用，避免同一图被重复构建（detect 主路径只构建
+    一次）；均为 None 时内部惰性构建（向后兼容）。
+
+    ``jpeg_penalty``（G5）：JPEG 8×8 压缩网格显著时（``detect_jpeg_grid``
+    判定），对 c ∈ {7,8,9,15,16,17,23,24,25}（即 8/16/24 ±1）候选的 edge
+    分数乘 ``JPEG_PENALTY_FACTOR``（0.6）——在归一化前施加，惩罚同样进入
+    归一化基准 max_edge，实现候选间的相对降权（JPEG 伪影是固定 8px 周期，
+    会在 8/16/24px 处系统性污染投票）。子谐波修正路径新增的候选分数同样
+    施加惩罚，保持一致性；ACF/FFT/BVR/comb 分数不受影响。
+
     Args:
         gray: 灰度图数组 (H, W)。
         profile: 1D 梯度投影信号。
@@ -561,6 +1350,11 @@ def _vote_period(
         edge_map: 边缘强度图 (H, W)，值域 [0,1]；None 时走旧路径。
         comb_weight: Spectral Comb 判据权重（0.0-1.0，从边界强度份额拆分）。
         use_comb_prefilter: 修正前是否要求 comb 与边界强度双一致。
+        edge_integral: ``edge_map`` 的 (H+1, W+1) 积分图；None 时内部构建。
+        gray_integral: ``gray`` 的 (H+1, W+1) 积分图；None 时内部构建。
+        gray_integral_sq: ``gray*gray`` 的 (H+1, W+1) 积分图；None 时内部构建。
+        jpeg_penalty: 是否对 8/16/24 ±1 候选的边界强度降权（默认 False，
+            完全兼容既有行为）。
 
     Returns:
         (best_period, confidence)：最佳周期与置信度（0-1）。
@@ -591,23 +1385,56 @@ def _vote_period(
     candidates = sorted(c for c in candidates if min_p <= c <= max_p)
     if not candidates:
         return (0.0, 0.0)
+    # 预构建积分图：边缘积分图供 _edge_band_strength 复用，灰度及其平方积分图
+    # 供 2D BVR 用 O(1) 块求和；detect 主路径由外部传入，仅直接调用时惰性构建
+    I_edge = None
+    I_gray = gray_integral
+    I_gray_sq = gray_integral_sq
+    if edge_map is not None:
+        I_edge = edge_integral if edge_integral is not None else _build_integral(edge_map)
+        if I_gray is None or I_gray_sq is None:
+            I_gray = _build_integral(gray)
+            I_gray_sq = _build_integral(gray * gray)
     # 对每个候选打分：先算廉价判据（ACF/FFT/边界强度），昂贵的 2D BVR
     # 只对廉价判据排名前 VOTE_BVR_LIMIT 的候选计算（BVR 是弱判据，且对
     # 像素格点阵类输入区分度差，不为低排名候选付出相位扫描成本）。
     # 旧路径（无 edge_map）的 legacy BVR 是 1D 条带、开销小，保持逐候选计算。
+    # FFT 谱支撑：对 profile 频谱只计算一次，候选分数取其频率 f=1/c 处幅值
+    # （相邻 bin 线性插值）/ 带内最大幅值，替代旧「距 FFT 主峰距离」近似，
+    # 消除主峰邻近候选被系统性高估/低估的问题
+    n_prof = int(np.size(profile))
+    if n_prof > 0:
+        prof_c = np.asarray(profile, dtype=np.float64)
+        prof_c = prof_c - prof_c.mean()
+        spec = np.abs(np.fft.rfft(prof_c))
+        freqs = np.fft.rfftfreq(n_prof, d=1.0)
+        band_mask = (freqs >= 1.0 / max_p) & (freqs <= 1.0 / min_p) & (freqs > 0)
+        band_max = float(spec[band_mask].max()) if band_mask.any() else 0.0
+    else:
+        spec = np.zeros(0)
+        band_max = 0.0
     scores: dict[int, dict[str, float]] = {}
     for c in candidates:
         # ACF 峰高（归一化到 [0,1]）
         acf_score = float(acf[c]) if c < len(acf) and acf[c] > 0 else 0.0
-        # FFT SNR（用 _fft_band_snr 对该周期附近评估）
-        # 简化：用主峰 SNR 作为所有候选的参考，候选离主峰越近分越高
-        if period_fft > 0:
-            dist = abs(c - period_fft) / max(period_fft, 1e-6)
-            fft_score = max(0.0, 1.0 - dist)
+        # FFT 谱支撑分：候选频率 f=1/c 处幅值（相邻 bin 线性插值），
+        # 除以带内最大幅值归一化到 [0,1]（带内无能量时为 0）
+        if band_max > 1e-12:
+            pos = (1.0 / c) * n_prof  # f*n 为浮点 bin 位置
+            pos = min(max(pos, 0.0), spec.size - 1)
+            i0 = int(pos)
+            i1 = min(i0 + 1, spec.size - 1)
+            amp = float(spec[i0] + (spec[i1] - spec[i0]) * (pos - i0))
+            fft_score = min(max(amp / band_max, 0.0), 1.0)
         else:
             fft_score = 0.0
         # 边界带边缘强度（廉价：积分图 + 条带求和）
-        edge = _edge_band_strength(edge_map, float(c), axis=axis) if edge_map is not None else 0.0
+        edge = _edge_band_strength(edge_map, float(c), axis=axis, integral=I_edge) if edge_map is not None else 0.0
+        # G5 JPEG 网格防护：8/16/24 ±1 候选降权（归一化前施加，惩罚进入
+        # 归一化基准 max_edge，实现候选间相对降权；JPEG 伪影固定 8px 周期
+        # 会在这些候选处系统性抬高边界强度）
+        if jpeg_penalty and c in JPEG_PENALTY_PERIODS:
+            edge *= JPEG_PENALTY_FACTOR
         scores[c] = {"acf": acf_score, "fft": fft_score, "bvr": 0.0, "edge": edge, "comb": 0.0}
     if edge_map is None:
         # 旧路径：legacy BVR 对全部候选计算（保持与旧版本行为一致）
@@ -620,7 +1447,9 @@ def _vote_period(
             key=lambda c: -(0.4 * scores[c]["acf"] + 0.3 * scores[c]["fft"] + 0.3 * scores[c]["edge"]),
         )
         for c in cheap_order[:VOTE_BVR_LIMIT]:
-            scores[c]["bvr"] = _block_variance_ratio(gray, float(c), axis=axis)
+            scores[c]["bvr"] = _block_variance_ratio(
+                gray, float(c), axis=axis, integral=I_gray, integral_sq=I_gray_sq
+            )
         # Spectral Comb（仅 comb_weight>0 时计入投票）
         if comb_weight > 0.0:
             for c in candidates:
@@ -723,11 +1552,17 @@ def _vote_period(
                 if not (min_p <= kp <= max_p) or kp not in peaks_set:
                     continue
                 if kp not in scores:
+                    # G5：修正路径新增候选同样施加 JPEG 网格降权（与主循环一致）
+                    kp_edge = _edge_band_strength(edge_map, float(kp), axis=axis, integral=I_edge)
+                    if jpeg_penalty and kp in JPEG_PENALTY_PERIODS:
+                        kp_edge *= JPEG_PENALTY_FACTOR
                     scores[kp] = {
                         "acf": float(acf[kp]) if kp < len(acf) and acf[kp] > 0 else 0.0,
                         "fft": 0.0,
-                        "bvr": _block_variance_ratio(gray, float(kp), axis=axis) / max_bvr,
-                        "edge": _edge_band_strength(edge_map, float(kp), axis=axis) / max_edge,
+                        "bvr": _block_variance_ratio(
+                            gray, float(kp), axis=axis, integral=I_gray, integral_sq=I_gray_sq
+                        ) / max_bvr,
+                        "edge": kp_edge / max_edge,
                         "comb": 0.0,
                     }
                     if comb_weight > 0.0:
@@ -764,6 +1599,10 @@ def _vote_period(
 def has_pixel_grid(
     gray: np.ndarray, min_p: int = 3, max_p: int = 40, snr_threshold: float = 8.0,
     edge_map: np.ndarray | None = None,
+    pre_normalized: bool = False,
+    edge_integral: np.ndarray | None = None,
+    sig_x: np.ndarray | None = None,
+    sig_y: np.ndarray | None = None,
 ) -> tuple[bool, float, float, float, float, float, float]:
     """检测图像是否具有像素网格周期。
 
@@ -780,19 +1619,28 @@ def has_pixel_grid(
         max_p: 最大候选周期。
         snr_threshold: 判定为网格的 SNR 阈值。
         edge_map: 边缘强度图 (H, W)，值域 [0,1]；None 时跳过方向保护（旧行为）。
+        pre_normalized: 为 True 时跳过内部 ``_local_contrast_normalize``
+            （调用方已预先归一化，detect 统一计算一次避免重复归一化）。
+        edge_integral: ``edge_map`` 的 (H+1, W+1) 积分图；None 时内部构建。
+        sig_x: 预计算的 X 方向投影信号 (W-1,)；None 时内部计算。
+            与 ``sig_y`` 配套传入可避免调用方重复计算（detect 主路径复用）。
+        sig_y: 预计算的 Y 方向投影信号 (H-1,)；None 时内部计算。
 
     Returns:
         (has, snr, period, period_x, period_y, snr_x, snr_y)：是否为网格、
         主方向信噪比与主周期、X 方向周期、Y 方向周期、X 方向 SNR、Y 方向 SNR。
     """
     gray = np.asarray(gray, dtype=np.float64)
-    gray = _local_contrast_normalize(gray)
-    # X 方向：列间梯度，按行求和
-    dx = np.abs(np.diff(gray, axis=1))  # (H, W-1)
-    sig_x = dx.sum(axis=0)  # (W-1,)
+    if not pre_normalized:
+        gray = _local_contrast_normalize(gray)
+    # X 方向：列间梯度，按行求和（外部传入时直接复用，避免重复计算）
+    if sig_x is None:
+        dx = np.abs(np.diff(gray, axis=1))  # (H, W-1)
+        sig_x = dx.sum(axis=0)  # (W-1,)
     # Y 方向：行间梯度，按列求和
-    dy = np.abs(np.diff(gray, axis=0))  # (H-1, W)
-    sig_y = dy.sum(axis=1)  # (H-1,)
+    if sig_y is None:
+        dy = np.abs(np.diff(gray, axis=0))  # (H-1, W)
+        sig_y = dy.sum(axis=1)  # (H-1,)
     snr_x, period_x = _fft_band_snr(sig_x, min_p, max_p)
     # ACF + 谐波解释交叉验证，纠正 FFT octave error
     peaks_x, _ = _acf_period(sig_x, min_p, max_p)
@@ -806,7 +1654,7 @@ def has_pixel_grid(
             if nearest_int >= 2 and abs(ratio - nearest_int) / nearest_int < 0.15:
                 # 方向保护：候选基频边界强度不得显著低于当前周期（防缩成纹理周期）
                 if edge_map is None or _direction_protection_ok(
-                    edge_map, acf_base_x, period_x, axis=1
+                    edge_map, acf_base_x, period_x, axis=1, integral=edge_integral
                 ):
                     period_x = float(acf_base_x)
 
@@ -819,7 +1667,7 @@ def has_pixel_grid(
             nearest_int = round(ratio)
             if nearest_int >= 2 and abs(ratio - nearest_int) / nearest_int < 0.15:
                 if edge_map is None or _direction_protection_ok(
-                    edge_map, acf_base_y, period_y, axis=0
+                    edge_map, acf_base_y, period_y, axis=0, integral=edge_integral
                 ):
                     period_y = float(acf_base_y)
     if snr_x >= snr_y:
@@ -831,18 +1679,26 @@ def has_pixel_grid(
 
 
 def _direction_protection_ok(
-    edge_map: np.ndarray, smaller: float, larger: float, axis: int
+    edge_map: np.ndarray, smaller: float, larger: float, axis: int,
+    integral: np.ndarray | None = None,
 ) -> bool:
     """ACF 纠正方向保护：小周期（候选基频）边界强度不得显著低于大周期。
 
     AI 伪像素图块内纹理周期 P/k 的边界带边缘强度远低于真实周期 P；
     若候选基频（更小周期）的边缘强度不足当前周期的 0.7 倍，判定其为
     纹理周期，拒绝把检测周期缩小到它。
+
+    Args:
+        edge_map: 边缘强度图 (H, W)。
+        smaller: 小周期（候选基频）。
+        larger: 大周期（当前周期）。
+        axis: 0=检测 y 方向周期，1=检测 x 方向周期。
+        integral: ``edge_map`` 的 (H+1, W+1) 积分图；None 时内部构建。
     """
     if edge_map is None or smaller <= 0 or larger <= 0:
         return True
-    e_small = _edge_band_strength(edge_map, float(smaller), axis=axis)
-    e_large = _edge_band_strength(edge_map, float(larger), axis=axis)
+    e_small = _edge_band_strength(edge_map, float(smaller), axis=axis, integral=integral)
+    e_large = _edge_band_strength(edge_map, float(larger), axis=axis, integral=integral)
     if e_large <= 1e-12:
         return True
     return e_small >= 0.7 * e_large
@@ -985,6 +1841,75 @@ def find_phase(
     return (best_phase_x, best_phase_y, float(conf))
 
 
+def find_phase_edge(
+    em: np.ndarray, px: float, py: float, step: float = 0.1
+) -> tuple[float, float, float]:
+    """在边缘强度图上扫描最佳网格相位（``signal="oklab"`` 色差模式）。
+
+    与灰度 ``find_phase`` 的块均值方差判据不同，本函数对每个候选相位
+    直接以块边界 1px 条带捕获的总边缘能量（条带强度和，语义同
+    ``_edge_band_strength`` 的单相位条带求和，积分图加速）为分数，
+    取能量最大的相位为最佳。等亮度异色块边界在灰度块方差上不可见，
+    但在（色差）边缘图上是连续强边缘，该判据仍可定位。
+
+    用条带强度和而非 ``_edge_band_strength`` 返回的均值：均值会把
+    图像左端无边界能量的条带计入分母，使相位系统性偏向"丢弃左端弱
+    条带"的错相（相位偏移近一个周期、块数少 1），条带和则单调偏好
+    覆盖全部边界带的相位，与 ``find_phase`` 的"相位 = 首条网格线"
+    约定一致。
+
+    置信度为峰中比设计：各方向 ``(峰值 - 中位数) / 峰值``（边界清晰时
+    峰值远高于错相中位数 → 趋近 1；边缘图平坦时趋近 0），X/Y 两方向
+    取平均，天然有界于 [0, 1]。
+
+    Args:
+        em: 边缘强度图 (H, W)，值域 [0, 1]（``compute_edge_map`` 灰度
+            边缘图或 ``_oklab_signal`` 色差边缘图）。
+        px: 块宽（像素）。
+        py: 块高（像素）。
+        step: 相位扫描步长。
+
+    Returns:
+        (best_phase_x, best_phase_y, conf)：最佳相位与峰中比置信度。
+        输入非法（非 2D 或周期 <= 0）时返回 (0.0, 0.0, 0.0)。
+    """
+    em = np.asarray(em, dtype=np.float64)
+    if em.ndim != 2 or px <= 0 or py <= 0:
+        return (0.0, 0.0, 0.0)
+    H, W = em.shape
+    I = _build_integral(em)
+    # 各列/行的边缘强度总和（积分图 O(1) 差分），条带求和退化为索引取值求和
+    col_sums = I[H, 1:] - I[H, :-1]  # (W,)
+    row_sums = I[1:, W] - I[:-1, W]  # (H,)
+
+    def _scan_axis(band_sums: np.ndarray, period: float) -> tuple[float, float]:
+        """单方向相位扫描：条带位置 rint(phase+m*p)，分数 = 条带强度和。"""
+        n_phases = max(1, int(round(period / step)))
+        phases = np.linspace(0.0, period, n_phases, endpoint=False)
+        L = band_sums.size
+        scores = np.zeros(n_phases, dtype=np.float64)
+        for i in range(n_phases):
+            ph = float(phases[i])
+            n = int((L - ph) // period)
+            if n < 1:
+                continue
+            idx = np.rint(ph + np.arange(n + 1) * period).astype(np.int64)
+            valid = (idx >= 0) & (idx < L)
+            if valid.any():
+                scores[i] = float(band_sums[idx[valid]].sum())
+        best = float(scores.max())
+        if best <= 1e-12:
+            return (0.0, 0.0)
+        median = float(np.median(scores))
+        conf = min(1.0, max(0.0, (best - median) / best))
+        return (float(phases[int(np.argmax(scores))]), conf)
+
+    best_phase_x, conf_x = _scan_axis(col_sums, px)
+    best_phase_y, conf_y = _scan_axis(row_sums, py)
+    conf = (conf_x + conf_y) / 2.0
+    return (best_phase_x, best_phase_y, float(conf))
+
+
 def detect(
     gray: np.ndarray, min_p: int = 3, max_p: int = 40, step: float = 0.1,
     snr_threshold: float = 8.0,
@@ -994,11 +1919,17 @@ def detect(
     outlier_reject_ratio: float = 0.5,
     comb_weight: float = 0.0,
     use_comb_prefilter: bool = False,
+    enable_runs_crosscheck: bool = True,
+    enable_plausibility_gate: bool = True,
+    signal: str = "gray",
+    enable_peak_lattice_fit: bool = False,
+    enable_comb_energy_score: bool = False,
+    jpeg_grid_guard: bool = False,
 ) -> Grid:
     """自动检测像素网格。
 
     Args:
-        gray: 灰度图数组。
+        gray: 灰度图数组 (H, W) 或 RGB 图数组 (H, W, 3)。
         min_p: 最小候选周期。
         max_p: 最大候选周期。
         step: 相位扫描步长。
@@ -1014,6 +1945,37 @@ def detect(
             默认 0（comb 默认关闭，真实图安全）。
         use_comb_prefilter: 子谐波修正前是否要求 comb 与边界强度双一致，
             透传给 ``_vote_period``，默认 False。
+        enable_runs_crosscheck: 是否启用 runs/GCD 整数尺度交叉验证
+            （Task 4，默认开启；False 时回退到纯投票路径）。
+        enable_plausibility_gate: 是否启用高分辨率合理性门控
+            （Task 5，默认开启；False 时回退到纯投票路径）。
+        signal: 检测信号模式，``"gray"``（默认，BT.601 灰度）或 ``"oklab"``
+            （OKLAB 感知色差）。oklab 模式仅对 3D RGB 输入生效：投影信号、
+            边缘图与相位搜索改用色差信号（等亮度异色块边界可见），BVR、
+            runs 交叉验证、梯度回退等灰度判据仍用 BT.601 灰度；2D 输入
+            恒走灰度路径（signal 参数被忽略）。
+        enable_peak_lattice_fit: 是否启用峰值格点拟合周期精化（G3，默认
+            关闭）。投票周期确定后对投影信号（灰度与 oklab 模式各自的
+            sig_x/sig_y）做峰值格点拟合，把周期精化为浮点值（支持非整数
+            块尺寸如 7.5px）；失败自动回退投票值。附轴一致性防护：精化前
+            两轴周期一致（相对差 ≤ 5%）而精化后显著分裂（相对差 > 2%）
+            时判定拟合锁错格点，两轴整体回退精化前投票值。
+        enable_comb_energy_score: 是否启用梳状能量集中度终审（G2，默认
+            关闭）。G3 精化后对投影信号做连续 (pitch, phase) 梳状打分：
+            真周期齿数最少且捕获全部边界能量，子谐波以双倍齿数仅多捕获
+            块内噪声（覆盖惩罚翻倍）、倍频漏一半边界（能量减半），数学
+            上必然低于真周期——原理性压制投票链的子谐波/倍频误检（如
+            干净硬边 7.5px 网格投票锁 30 的对齐倍数误检）。每轴独立
+            接受：置信度 ≥ 0.35 且 pitch > 0 时覆盖该轴周期，低置信自动
+            回退 G3/投票链结果；梳相位仅作参考，不透传 find_phase。
+        jpeg_grid_guard: 是否启用 JPEG 8×8 压缩网格检测与候选降权（G5，
+            默认关闭）。用 ``detect_jpeg_grid`` 对灰度做交叉差分投票（一次，
+            两轴共用），检测出显著 JPEG 网格相位时向两轴 ``_vote_period``
+            传 ``jpeg_penalty``，对 8/16/24 ±1 候选的边界强度降权
+            （×0.6），防护 JPEG 压缩伪影的固定 8px 周期污染周期投票。
+            G2 梳状终审/G3 峰值拟合为图像域独立判据，不受惩罚影响；
+            检测结果 ``(is_significant, phase, strength)`` 记录进
+            ``Grid.jpeg_grid`` 供 A/B 分析。
 
     Returns:
         Grid: 检测结果。
@@ -1021,12 +1983,57 @@ def detect(
     Raises:
         ValueError: 未检测到像素网格周期。
     """
-    gray_arr = np.asarray(gray, dtype=np.float64)
+    arr = np.asarray(gray, dtype=np.float64)
+    # 输入分发：oklab 色差模式仅对 3D RGB 输入生效（2D 输入静默走灰度路径）；
+    # 3D + signal="gray" 先转 BT.601 灰度再走原路径（向后兼容）
+    use_oklab = arr.ndim == 3 and signal == "oklab"
+    if use_oklab:
+        # 色差路径：投影信号/边缘图来自 OKLAB 色差（_oklab_signal），
+        # 灰度判据（BVR/runs/梯度回退）仍用 BT.601 灰度
+        sig_x, sig_y, edge_map, gray_arr = _oklab_signal(arr)
+        # has_pixel_grid 直传 sig_x/sig_y，灰度参数不参与信号计算
+        norm_gray = gray_arr
+    else:
+        if arr.ndim == 3:
+            gray_arr = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+        else:
+            gray_arr = arr
+        # 边缘图统一计算一次，供方向保护 / 投票 / 方块检测 / 边缘扩展复用
+        edge_map = compute_edge_map(gray_arr)
+        # Task 2：归一化灰度只计算一次，同时供 has_pixel_grid 与 sig_x/sig_y
+        # （两阶段使用同一信号来源，消除 has_pixel_grid(FFT) 与投票的预处理不一致）
+        norm_gray = _local_contrast_normalize(gray_arr)
+        # 投影信号只计算一次：has_pixel_grid 与下方投票共用同一对信号（F1 去重）
+        sig_x = np.abs(np.diff(norm_gray, axis=1)).sum(axis=0)
+        sig_y = np.abs(np.diff(norm_gray, axis=0)).sum(axis=1)
     H, W = gray_arr.shape
-    # 边缘图统一计算一次，供方向保护 / 投票 / 方块检测 / 边缘扩展复用
-    edge_map = compute_edge_map(gray_arr)
+    # 积分图统一构建一次，供 _edge_band_strength 与 2D BVR 复用，
+    # 避免每个候选周期/每条路径重复重建整图积分图（大图下 O(H·W) 是热点）
+    I_edge = _build_integral(edge_map)
+    I_gray = _build_integral(gray_arr)
+    I_gray_sq = _build_integral(gray_arr * gray_arr)
+
+    # --- G5：JPEG 8×8 压缩网格检测（一次，两轴共用）---
+    # 交叉差分投票检测 JPEG 网格相位；显著时向两轴 _vote_period 传
+    # jpeg_penalty 对 8/16/24 ±1 候选降权（JPEG 伪影固定 8px 周期，会在
+    # 8/16/24px 处系统性污染投票）。检测结果记录进 Grid.jpeg_grid 供
+    # A/B 分析；G2/G3 为图像域独立判据，不受惩罚影响。
+    jpeg_grid_info: tuple = ()
+    jpeg_penalty_flag = False
+    if jpeg_grid_guard:
+        j_sig, j_phase, j_strength = detect_jpeg_grid(gray_arr)
+        jpeg_grid_info = (j_sig, j_phase, j_strength)
+        jpeg_penalty_flag = j_sig
+
+    def _phase_search(p_x: float, p_y: float) -> tuple[float, float, float]:
+        """相位搜索：oklab 模式在色差边缘图上找边界带能量峰，灰度模式用块方差。"""
+        if use_oklab:
+            return find_phase_edge(edge_map, p_x, p_y, step)
+        return find_phase(gray_arr, p_x, p_y, step)
+
     has, snr, period, period_x, period_y, snr_x, snr_y = has_pixel_grid(
-        gray_arr, min_p, max_p, snr_threshold=snr_threshold, edge_map=edge_map,
+        norm_gray, min_p, max_p, snr_threshold=snr_threshold, edge_map=edge_map,
+        pre_normalized=True, edge_integral=I_edge, sig_x=sig_x, sig_y=sig_y,
     )
     has_fft = bool(has)  # 保存 FFT 原始判定，用于低置信度拒绝
     if not has:
@@ -1044,31 +2051,101 @@ def detect(
         has = True
 
     # 多判据投票：ACF + FFT + 块方差对比度 + 边界强度综合选周期
-    sig_x = np.abs(np.diff(gray_arr, axis=1)).sum(axis=0)
-    sig_y = np.abs(np.diff(gray_arr, axis=0)).sum(axis=1)
+    # 投影信号已在上方与 has_pixel_grid 共用计算（同一信号来源）；
+    # BVR 判据仍用原始 gray_arr（只换 profile，不改变 BVR 语义）
     vote_px, conf_x = _vote_period(
         gray_arr, sig_x, min_p, max_p, axis=1, edge_map=edge_map,
         comb_weight=comb_weight, use_comb_prefilter=use_comb_prefilter,
+        edge_integral=I_edge, gray_integral=I_gray, gray_integral_sq=I_gray_sq,
+        jpeg_penalty=jpeg_penalty_flag,
     )
     vote_py, conf_y = _vote_period(
         gray_arr, sig_y, min_p, max_p, axis=0, edge_map=edge_map,
         comb_weight=comb_weight, use_comb_prefilter=use_comb_prefilter,
+        edge_integral=I_edge, gray_integral=I_gray, gray_integral_sq=I_gray_sq,
+        jpeg_penalty=jpeg_penalty_flag,
     )
     # 投票结果覆盖 FFT：置信度高，或边界强度显著更高
     # （FFT 主峰易被块内纹理污染，而边界带边缘强度判据不受其影响；
     #   纹理场景投票置信度偏低，但边界强度仍可靠，故用 edge 无条件覆盖）
     if vote_px > 0:
-        e_vote = _edge_band_strength(edge_map, vote_px, axis=1)
-        e_fft = _edge_band_strength(edge_map, period_x, axis=1) if period_x > 0 else 0.0
+        e_vote = _edge_band_strength(edge_map, vote_px, axis=1, integral=I_edge)
+        e_fft = _edge_band_strength(edge_map, period_x, axis=1, integral=I_edge) if period_x > 0 else 0.0
         if conf_x > 0.3 or (e_vote > 1e-12 and e_fft > 1e-12 and e_vote > 1.2 * e_fft):
             period_x = float(vote_px)
     if vote_py > 0:
-        e_vote = _edge_band_strength(edge_map, vote_py, axis=0)
-        e_fft = _edge_band_strength(edge_map, period_y, axis=0) if period_y > 0 else 0.0
+        e_vote = _edge_band_strength(edge_map, vote_py, axis=0, integral=I_edge)
+        e_fft = _edge_band_strength(edge_map, period_y, axis=0, integral=I_edge) if period_y > 0 else 0.0
         if conf_y > 0.3 or (e_vote > 1e-12 and e_fft > 1e-12 and e_vote > 1.2 * e_fft):
             period_y = float(vote_py)
     # 综合置信度
     vote_conf = (conf_x + conf_y) / 2.0
+
+    # --- Task 4：runs/GCD 整数尺度交叉验证（最终 px/py 选择前）---
+    # 基于像素行程长度 GCD 的整数尺度作为投票的正交交叉验证先验：
+    # 证据强（命中率达标 + x/y 一致 + 尺度在范围）时按规则修正周期，
+    # 失败/无证据时静默回退到纯投票结果（默认行为零回归）。
+    if enable_runs_crosscheck:
+        runs_x, runs_y, runs_hit, _runs_conf = detect_integer_scale(
+            gray_arr, min_p=min_p, max_p=max_p,
+        )
+        if (runs_x > 0 and runs_y > 0 and runs_x == runs_y
+                and runs_hit >= RUNS_STRONG_HIT_RATE):
+            runs_scale = float(runs_x)
+            period_x = _runs_correct_period(
+                period_x, vote_px, runs_scale, edge_map, axis=1,
+                min_p=min_p, max_p=max_p, edge_integral=I_edge,
+            )
+            period_y = _runs_correct_period(
+                period_y, vote_py, runs_scale, edge_map, axis=0,
+                min_p=min_p, max_p=max_p, edge_integral=I_edge,
+            )
+
+    # --- G3：峰值格点拟合周期精化（runs/GCD 交叉验证之后、px/py 选择之前）---
+    # 投票/runs 输出的周期常为整数或粗估值（真实案例 7.45/7.48px 非整数周期
+    # 未被精化）；对投影信号做峰值格点拟合把周期精化为浮点值。灰度与 oklab
+    # 两种信号模式都生效（profile 来源不同而已）。失败自动回退投票值，
+    # 精化成功则后续 px/py 选择（含统一正方形分支、长宽比校验）、门控、
+    # 相位与方块检测全部自然使用精化值。
+    if enable_peak_lattice_fit:
+        orig_px, orig_py = period_x, period_y
+        if period_x > 0:
+            period_x = _refine_period_peak_lattice(sig_x, period_x, min_p, max_p)
+        if period_y > 0:
+            period_y = _refine_period_peak_lattice(sig_y, period_y, min_p, max_p)
+        # 轴一致性防护：正方形网格两轴投影来自同一格点结构，精化成功时
+        # 两轴周期应几乎一致；若投票周期本就两轴一致、精化后反而显著
+        # 分裂（单轴锁错格点，如 image02 x 回退 20.0 / y 精化 20.804），
+        # 判定拟合不可信——两轴整体回退精化前投票值，行为与关闭 G3 一致。
+        # 原本两轴就不一致的非方格（相对差 > 5%，如 slice_01 的 8/7）
+        # 精化各自独立进行，不适用本防护；两轴同时精化失败时
+        # refined == orig，回退为无操作，同样不改变结果。
+        if orig_px > 0 and orig_py > 0:
+            orig_diff = abs(orig_px - orig_py) / max(orig_px, orig_py)
+            refined_diff = abs(period_x - period_y) / max(period_x, period_y)
+            if (orig_diff <= PEAK_LATTICE_AXIS_ORIG_REL
+                    and refined_diff > PEAK_LATTICE_AXIS_GUARD_REL):
+                period_x, period_y = orig_px, orig_py
+
+    # --- G2：梳状能量集中度终审（G3 之后、px/py 选择之前）---
+    # 连续 (pitch, phase) 梳状打分对两轴投影信号做周期终审：子谐波以双倍
+    # 齿数仅多捕获块内噪声（覆盖惩罚翻倍）、倍频漏一半边界（能量减半），
+    # 数学上必然低于真周期——原理性压制投票链的子谐波/倍频误检。每轴独立
+    # 接受：置信度 ≥ COMB_ACCEPT_CONF 且 pitch > 0 时覆盖该轴周期，否则
+    # 保持 G3/投票链结果（低置信自动回退）。梳相位仅作参考不透传
+    # find_phase（find_phase/find_phase_edge 有自己的相位搜索）；终审
+    # 覆盖后 px/py 选择、门控、相位与方块检测全部自然使用新值。
+    comb_conf_x = 0.0
+    comb_conf_y = 0.0
+    if enable_comb_energy_score:
+        pitch_cx, _phase_cx, conf_cx = _comb_best_period(sig_x, min_p, max_p)
+        comb_conf_x = float(conf_cx)
+        if conf_cx >= COMB_ACCEPT_CONF and pitch_cx > 0:
+            period_x = float(pitch_cx)
+        pitch_cy, _phase_cy, conf_cy = _comb_best_period(sig_y, min_p, max_p)
+        comb_conf_y = float(conf_cy)
+        if conf_cy >= COMB_ACCEPT_CONF and pitch_cy > 0:
+            period_y = float(pitch_cy)
 
     # --- px/py 选择策略 ---
     # 1. 某方向检测失败（period 为 0）：使用非零值作为统一 px=py
@@ -1093,7 +2170,7 @@ def detect(
             # 3. 差异大：分别使用，但做长宽比校验
             px = float(period_x)
             py = float(period_y)
-            phase_x_t, phase_y_t, conf_t = find_phase(gray_arr, px, py, step)
+            phase_x_t, phase_y_t, conf_t = _phase_search(px, py)
             w_logic_t = int(round((W - phase_x_t) / px))
             h_logic_t = int(round((H - phase_y_t) / py))
             if w_logic_t > 0 and h_logic_t > 0:
@@ -1103,15 +2180,31 @@ def detect(
                 if ratio_diff > 0.3:
                     # 长宽比畸变：回退为正方形块（取边界强度较高方向的周期，
                     # SNR 同样受块内纹理污染，边界强度判据更可靠）
-                    e_x = _edge_band_strength(edge_map, px, axis=1)
-                    e_y = _edge_band_strength(edge_map, py, axis=0)
+                    e_x = _edge_band_strength(edge_map, px, axis=1, integral=I_edge)
+                    e_y = _edge_band_strength(edge_map, py, axis=0, integral=I_edge)
                     if e_x >= e_y:
                         px = py = float(period_x)
                     else:
                         px = py = float(period_y)
             # 若回退了，下面会重新计算相位；若未回退，也重新计算（统一流程）
 
-    phase_x, phase_y, conf = find_phase(gray_arr, px, py, step)
+    # --- Task 5：高分辨率合理性门控（确定最佳周期后、find_phase 前）---
+    # 防止把 1-2px 生成纹理误当真实网格：若最佳周期 < 3px 且其整数倍
+    # 边界带显著更强（说明小周期是块内纹理而非网格边界），采纳更大周期。
+    if enable_plausibility_gate:
+        if abs(px - py) <= 0.15 * max(px, py):
+            # 统一正方形块：x/y 两轴分别门控后取一致结果，保持 px == py
+            gx = _plausibility_gate_axis(px, edge_map, axis=1, min_p=min_p, max_p=max_p, edge_integral=I_edge)
+            gy = _plausibility_gate_axis(py, edge_map, axis=0, min_p=min_p, max_p=max_p, edge_integral=I_edge)
+            if gx >= gy:
+                px = py = gx
+            else:
+                px = py = gy
+        else:
+            px = _plausibility_gate_axis(px, edge_map, axis=1, min_p=min_p, max_p=max_p, edge_integral=I_edge)
+            py = _plausibility_gate_axis(py, edge_map, axis=0, min_p=min_p, max_p=max_p, edge_integral=I_edge)
+
+    phase_x, phase_y, conf = _phase_search(px, py)
     # 综合投票置信度与相位置信度
     conf = min(1.0, max(conf, vote_conf))
 
@@ -1182,24 +2275,40 @@ def detect(
     return Grid(
         w_logic, h_logic, px, py, phase_x, phase_y, conf, candidates,
         cell_ys=cell_ys, cell_xs=cell_xs, comb_score=comb_score,
+        low_confidence=bool(conf < 0.4),
+        comb_energy_conf=(comb_conf_x + comb_conf_y) / 2.0,
+        jpeg_grid=jpeg_grid_info,
     )
 
 
 def detect_with_user_grid(
-    gray: np.ndarray, w: int, h: int, step: float = 0.1
+    gray: np.ndarray, w: int, h: int, step: float = 0.1, signal: str = "gray"
 ) -> Grid:
     """用户指定逻辑分辨率，反推块尺寸并定相。
 
     Args:
-        gray: 灰度图数组。
+        gray: 灰度图数组 (H, W) 或 RGB 图数组 (H, W, 3)。
         w: 用户指定逻辑宽。
         h: 用户指定逻辑高。
         step: 相位扫描步长。
+        signal: 检测信号模式，``"gray"``（默认）或 ``"oklab"``。oklab 模式
+            仅对 3D RGB 输入生效：相位搜索改在 OKLAB 色差边缘图上进行
+            （等亮度异色块边界可见）；2D 输入恒走灰度路径。
 
     Returns:
         Grid: 检测结果。
     """
-    gray_arr = np.asarray(gray, dtype=np.float64)
+    arr = np.asarray(gray, dtype=np.float64)
+    if arr.ndim == 3 and signal == "oklab":
+        # 色差路径：相位搜索用 OKLAB 色差边缘图（仅需边缘图，无需投影信号）
+        gray_arr = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+        edge_map = _oklab_edge_map(rgb_to_oklab(arr))
+    else:
+        if arr.ndim == 3:
+            gray_arr = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+        else:
+            gray_arr = arr
+        edge_map = None
     H, W = gray_arr.shape
     if not isinstance(w, int) or not isinstance(h, int) or w <= 0 or h <= 0:
         raise ValueError(f"逻辑分辨率必须为正整数，得到 w={w}, h={h}")
@@ -1207,12 +2316,15 @@ def detect_with_user_grid(
         raise ValueError(f"逻辑分辨率不能超过图像尺寸：w={w} > W={W} 或 h={h} > H={H}")
     px = gray_arr.shape[1] / w
     py = gray_arr.shape[0] / h
-    phase_x, phase_y, conf = find_phase(gray_arr, px, py, step)
+    if edge_map is not None:
+        phase_x, phase_y, conf = find_phase_edge(edge_map, px, py, step)
+    else:
+        phase_x, phase_y, conf = find_phase(gray_arr, px, py, step)
     # 用户指定分辨率路径：由全局相位 + 等距网格生成 cell_ys/cell_xs
     cell_ys, cell_xs = _equidistant_cell_grid(phase_x, phase_y, px, py, w, h)
     return Grid(
         w, h, px, py, phase_x, phase_y, conf, [(w, h, conf)],
-        cell_ys=cell_ys, cell_xs=cell_xs,
+        cell_ys=cell_ys, cell_xs=cell_xs, low_confidence=bool(conf < 0.4),
     )
 
 
@@ -1238,12 +2350,41 @@ def _gaussian_smooth_1d(profile: np.ndarray, kernel_size: int) -> np.ndarray:
     return np.convolve(profile, ker, mode="same")
 
 
+def _normalize_combine_edge(mag: np.ndarray) -> np.ndarray:
+    """边缘幅值图的归一化组合，缩放到 [0, 1]。
+
+    ``compute_edge_map`` 的组合核心：``max(幅值/全局最大值, 33×33 局部
+    对比度归一化值)`` 后整体缩放到 [0, 1]。抽出为独立函数供灰度 Sobel
+    路径（``compute_edge_map``）与 OKLAB 色差路径（``_oklab_edge_map``）
+    复用，保证两条路径的边缘图组合逻辑一致（重构自 compute_edge_map，
+    灰度路径行为逐位不变）。
+
+    Args:
+        mag: 2D 边缘幅值图。
+
+    Returns:
+        ``(H, W)`` float64 边缘强度图，值域 [0, 1]；全零输入返回全零。
+    """
+    mag = np.asarray(mag, dtype=np.float64)
+    global_max = float(mag.max())
+    if global_max < 1e-12:
+        return np.zeros_like(mag)
+    mag_norm = mag / global_max
+    local_norm = _local_contrast_normalize(mag, window=33)
+    combined = np.maximum(mag_norm, local_norm)
+    cmax = float(combined.max())
+    if cmax > 1e-12:
+        combined = combined / cmax
+    return combined
+
+
 def compute_edge_map(img: np.ndarray) -> np.ndarray:
     """计算 2D 边缘强度图。
 
     对输入图像（灰度 2D 或 RGB 3D）计算 Sobel 梯度幅值，再做 33×33
     局部归一化（复用 ``_local_contrast_normalize`` 的钳位局部 std 思路），
-    组合 ``max(原始幅值/全局最大值, 局部归一化值)`` 后整体缩放到 [0, 1]。
+    组合 ``max(原始幅值/全局最大值, 局部归一化值)`` 后整体缩放到 [0, 1]
+    （组合部分由 ``_normalize_combine_edge`` 实现）。
 
     Args:
         img: ``(H, W)`` 灰度图或 ``(H, W, 3)`` RGB 图（float64）。
@@ -1261,16 +2402,94 @@ def compute_edge_map(img: np.ndarray) -> np.ndarray:
     gx = sobel(gray, axis=1, mode="reflect")
     gy = sobel(gray, axis=0, mode="reflect")
     mag = np.sqrt(gx * gx + gy * gy)
-    global_max = float(mag.max())
-    if global_max < 1e-12:
-        return np.zeros_like(gray)
-    mag_norm = mag / global_max
-    local_norm = _local_contrast_normalize(mag, window=33)
-    combined = np.maximum(mag_norm, local_norm)
-    cmax = float(combined.max())
-    if cmax > 1e-12:
-        combined = combined / cmax
-    return combined
+    return _normalize_combine_edge(mag)
+
+
+def _oklab_edge_map(oklab: np.ndarray) -> np.ndarray:
+    """由 OKLAB 数组构造色差边缘强度图。
+
+    对原始（非归一化）OKLAB 取相邻像素前向差分的 L2 范数作为逐像素
+    色差幅值：Mdx[j] 记录第 j 与 j+1 列的色差、Mdy[i] 记录第 i 与 i+1
+    行的色差，均计入右/下侧像素（缺失侧补 0 对齐到 ``(H, W)``），组合
+    ``sqrt(Mdx^2 + Mdy^2)`` 后经 ``_normalize_combine_edge`` 缩放到
+    [0, 1]。等亮度异色块边界（BT.601 灰度梯度为 0）在此图上仍是
+    连续强边缘。
+
+    边界能量计入右/下块首像素的约定与 ``find_phase`` 的"相位 = 首条
+    网格线"块起点语义对齐：块边界条带落在边界列/行本身，使
+    ``_edge_band_strength`` 默认相位 0 恰好命中对齐网格的边界带。
+
+    Args:
+        oklab: ``(H, W, 3)`` OKLab 数组（``rgb_to_oklab`` 输出）。
+
+    Returns:
+        ``(H, W)`` float64 色差边缘强度图，值域 [0, 1]。
+    """
+    oklab = np.asarray(oklab, dtype=np.float64)
+    H, W = oklab.shape[:2]
+    # 逐通道差分平方累加得各方向色差幅值（与 3D 差分 ||·||₂ 逐位同构，
+    # 求和次序一致），避免 (H, W, 3) 大临时数组
+    sq_x = np.zeros((H, W), dtype=np.float64)
+    sq_y = np.zeros((H, W), dtype=np.float64)
+    for c in range(oklab.shape[2]):
+        ch = oklab[:, :, c]
+        ddx = ch[:, 1:] - ch[:, :-1]
+        sq_x[:, 1:] += ddx * ddx
+        ddy = ch[1:, :] - ch[:-1, :]
+        sq_y[1:, :] += ddy * ddy
+    Mdx = np.sqrt(sq_x, out=sq_x)
+    Mdy = np.sqrt(sq_y, out=sq_y)
+    mag = np.sqrt(Mdx * Mdx + Mdy * Mdy)
+    return _normalize_combine_edge(mag)
+
+
+def _oklab_signal(img_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """计算 OKLAB 色差检测信号（``signal="oklab"`` 模式的信号原语）。
+
+    等亮度异色块边界（BT.601 灰度梯度 ≈ 0）在灰度路径的边缘图、投影
+    信号与相位搜索中全部不可见。本函数改用 OKLAB 感知色差构造检测
+    信号，供 ``detect(signal="oklab")`` 的全链路（FFT/ACF 判据、投票、
+    方块检测、相位搜索）使用：
+
+    - 投影信号 ``sig_x``/``sig_y``：对 OKLAB 每通道独立做局部对比度
+      归一化（与灰度路径"先归一化再差分"同构，弱色度边缘被有界放大），
+      再取相邻像素差分的 L2 范数沿另一轴求和，与灰度路径投影信号
+      同形同义；
+    - 边缘图 ``edge_map``：原始 OKLAB 前向差分的逐像素幅值
+      （``_oklab_edge_map``），组合逻辑与灰度 ``compute_edge_map`` 一致；
+    - ``gray``：BT.601 灰度。BVR、runs 交叉验证、梯度回退等灰度判据
+      仍基于它（语义与灰度路径一致）。
+
+    Args:
+        img_rgb: ``(H, W, 3)`` RGB 0-255 浮点数组。
+
+    Returns:
+        (sig_x, sig_y, edge_map, gray)：
+        ``sig_x`` 形状 ``(W-1,)``、``sig_y`` 形状 ``(H-1,)``（投影信号），
+        ``edge_map`` 形状 ``(H, W)`` 值域 [0, 1]（色差边缘图），
+        ``gray`` 形状 ``(H, W)``（BT.601 灰度）。
+    """
+    img = np.asarray(img_rgb, dtype=np.float64)
+    oklab = rgb_to_oklab(img)
+    H, W = img.shape[:2]
+    # 每通道独立局部对比度归一化（放大弱色度边缘），逐通道差分平方累加得
+    # L2 范数（与 3D 差分 ||·||₂ 逐位同构，求和次序一致），避免 (H, W, 3)
+    # 大临时数组，降低 2048×2048 级输入的峰值内存
+    sq_x = np.zeros((H, W - 1), dtype=np.float64)
+    sq_y = np.zeros((H - 1, W), dtype=np.float64)
+    for c in range(oklab.shape[2]):
+        nc = _local_contrast_normalize(oklab[:, :, c])
+        dxc = nc[:, 1:] - nc[:, :-1]
+        sq_x += dxc * dxc
+        dyc = nc[1:, :] - nc[:-1, :]
+        sq_y += dyc * dyc
+    np.sqrt(sq_x, out=sq_x)
+    np.sqrt(sq_y, out=sq_y)
+    sig_x = sq_x.sum(axis=0)  # (W-1,)
+    sig_y = sq_y.sum(axis=1)  # (H-1,)
+    edge_map = _oklab_edge_map(oklab)
+    gray = 0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]
+    return (sig_x, sig_y, edge_map, gray)
 
 
 def _equidistant_cell_grid(
@@ -1928,8 +3147,6 @@ def expand_grid_edge_guided(
     """
     em = np.asarray(edge_map, dtype=np.float64)
     H, W = em.shape
-    px_i = max(1, int(round(px)))
-    py_i = max(1, int(round(py)))
     min_gx, max_gx, min_gy, max_gy = grid_bounds
     w_logic = max_gx - min_gx + 1
     h_logic = max_gy - min_gy + 1
@@ -1980,7 +3197,7 @@ def expand_grid_edge_guided(
                 else:
                     nx0 = cx1
                     weights[ng] = 1.0
-                nx1 = nx0 + px_i
+                nx1 = nx0 + px  # 浮点周期外推，避免非整数周期累积取整漂移
                 placed[ng] = (cy0, nx0, cy1, nx1)
             elif dx == -1:  # 向左扩展，共享垂直边界在 cx0 附近
                 bc, peak = _best_col(em, iy0, iy1, cx0, edge_tol, enable_subpixel_refine)
@@ -1990,7 +3207,7 @@ def expand_grid_edge_guided(
                 else:
                     nx1 = cx0
                     weights[ng] = 1.0
-                nx0 = nx1 - px_i
+                nx0 = nx1 - px
                 placed[ng] = (cy0, nx0, cy1, nx1)
             elif dy == 1:  # 向下扩展，共享水平边界在 cy1 附近
                 br, peak = _best_row(em, ix0, ix1, cy1, edge_tol, enable_subpixel_refine)
@@ -2000,7 +3217,7 @@ def expand_grid_edge_guided(
                 else:
                     ny0 = cy1
                     weights[ng] = 1.0
-                ny1 = ny0 + py_i
+                ny1 = ny0 + py
                 placed[ng] = (ny0, cx0, ny1, cx1)
             else:  # dy == -1，向上扩展，共享水平边界在 cy0 附近
                 br, peak = _best_row(em, ix0, ix1, cy0, edge_tol, enable_subpixel_refine)
@@ -2010,7 +3227,7 @@ def expand_grid_edge_guided(
                 else:
                     ny1 = cy0
                     weights[ng] = 1.0
-                ny0 = ny1 - py_i
+                ny0 = ny1 - py
                 placed[ng] = (ny0, cx0, ny1, cx1)
             queue.append(ng)
 
@@ -2018,9 +3235,9 @@ def expand_grid_edge_guided(
     for gy in range(min_gy, max_gy + 1):
         for gx in range(min_gx, max_gx + 1):
             if (gx, gy) not in placed:
-                nx0 = seed_x0 + gx * px_i
-                ny0 = seed_y0 + gy * py_i
-                placed[(gx, gy)] = (ny0, nx0, ny0 + py_i, nx0 + px_i)
+                nx0 = seed_x0 + gx * px
+                ny0 = seed_y0 + gy * py
+                placed[(gx, gy)] = (ny0, nx0, ny0 + py, nx0 + px)
                 weights[(gx, gy)] = 1.0
 
     # 加权中位数聚合：每个格子贡献 4 个角观测
@@ -2053,8 +3270,8 @@ def expand_grid_edge_guided(
             cell_xs[jj_k, ii_k] = _weighted_median(obs)
 
     # 无观测的交点用理想外推
-    ideal_y = seed_y0 + (np.arange(h_logic + 1) + min_gy) * py_i
-    ideal_x = seed_x0 + (np.arange(w_logic + 1) + min_gx) * px_i
+    ideal_y = seed_y0 + (np.arange(h_logic + 1) + min_gy) * py
+    ideal_x = seed_x0 + (np.arange(w_logic + 1) + min_gx) * px
     ideal_ys = np.broadcast_to(ideal_y[:, None], (h_logic + 1, w_logic + 1))
     ideal_xs = np.broadcast_to(ideal_x[None, :], (h_logic + 1, w_logic + 1))
     cell_ys = np.where(ys_cnt == 0, ideal_ys, cell_ys)

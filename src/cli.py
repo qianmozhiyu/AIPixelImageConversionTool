@@ -22,9 +22,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-o", "--output", default="output.png", help="输出 PNG 路径")
     parser.add_argument(
         "--extract-method",
-        choices=["median", "mean", "mode", "kmeans"],
+        choices=["median", "mean", "mode", "kmeans", "dominant"],
         default="median",
-        help="块提取代表色算法：median（默认，与 GUI 一致）/mean/mode/kmeans",
+        help="块提取代表色算法：median（默认，与 GUI 一致）/mean/mode/kmeans/dominant",
     )
     parser.add_argument(
         "--extract-core-ratio",
@@ -82,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--upscale",
         action="store_true",
-        help="启用降噪后的双线性放大（默认关闭，与 GUI/库默认一致）",
+        help="启用降噪后的放大（默认算法 nearest，默认关闭，与 GUI/库默认一致）",
     )
     parser.add_argument(
         "--no-upscale",
@@ -149,6 +149,59 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="当检测到的逻辑分辨率与正方形差 1 时，自动修正为正方形输出",
     )
+    parser.add_argument(
+        "--aa-removal",
+        action="store_true",
+        help="启用抗锯齿消除预处理（默认关闭）",
+    )
+    parser.add_argument(
+        "--aa-passes",
+        type=int,
+        default=2,
+        help="抗锯齿消除迭代次数（默认 2）",
+    )
+    parser.add_argument(
+        "--aa-threshold",
+        type=float,
+        default=0.5,
+        help="抗锯齿消除两主色距离阈值（默认 0.5）",
+    )
+    parser.add_argument(
+        "--detect-signal",
+        choices=["gray", "oklab"],
+        default="gray",
+        help="网格检测信号模式：gray（默认，BT.601 灰度）/oklab（OKLAB 感知色差，等亮度异色块边界可见）",
+    )
+    parser.add_argument(
+        "--pre-quantize",
+        action="store_true",
+        help="启用网格检测前预量化（默认关闭）",
+    )
+    parser.add_argument(
+        "--denoise-guard",
+        action="store_true",
+        help="启用去噪-检测耦合保护（默认关闭）",
+    )
+    parser.add_argument(
+        "--no-peak-lattice-fit",
+        action="store_true",
+        help="禁用峰值格点拟合周期精化（默认开启）：投票周期确定后拟合格点间距"
+        "精化为浮点周期，支持非整数块尺寸如 7.5px，失败自动回退投票值；"
+        "轴一致性防护下精化前两轴一致而精化后分裂时整体回退投票值",
+    )
+    parser.add_argument(
+        "--no-comb-energy-score",
+        action="store_true",
+        help="禁用梳状能量集中度终审（默认开启）：对投影信号做连续 (pitch, phase) "
+        "梳状打分，原理性压制子谐波/倍频误检（子谐波覆盖惩罚翻倍、倍频能量减半），"
+        "低置信自动回退投票结果",
+    )
+    parser.add_argument(
+        "--no-jpeg-grid-guard",
+        action="store_true",
+        help="禁用 JPEG 8×8 压缩网格检测与候选降权（默认开启）：交叉差分投票检测"
+        " JPEG DCT 网格相位，显著时对 8/16/24px 附近候选降权，防护压缩伪影周期误检",
+    )
     args = parser.parse_args(argv)
 
     import time
@@ -170,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
         clahe_clip_limit=args.clahe_clip_limit,
         min_p=args.grid_min,
         max_p=args.grid_max,
+        detect_signal=args.detect_signal,
         snr_threshold=args.snr_threshold,
         edge_search_tolerance=args.edge_tol,
         enable_subpixel_refine=not args.no_subpixel,
@@ -183,6 +237,14 @@ def main(argv: list[str] | None = None) -> int:
         enable_palette_refine=not args.no_palette_refine,
         palette_colors=args.palette_colors,
         fix_square=args.fix_square,
+        enable_aa_removal=args.aa_removal,
+        aa_removal_passes=args.aa_passes,
+        aa_removal_threshold=args.aa_threshold,
+        enable_pre_quantize=args.pre_quantize,
+        denoise_grid_guard=args.denoise_guard,
+        enable_peak_lattice_fit=not args.no_peak_lattice_fit,
+        enable_comb_energy_score=not args.no_comb_energy_score,
+        jpeg_grid_guard=not args.no_jpeg_grid_guard,
     )
     pipeline = Pipeline(params)
     try:

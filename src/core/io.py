@@ -58,7 +58,7 @@ def save_image(arr: np.ndarray, path: str | Path, scale: int = 1) -> None:
     img = Image.fromarray(arr_u8, mode="RGB")
     if scale > 1:
         w, h = img.size
-        img = img.resize((w * scale, h * scale), Image.NEAREST)
+        img = img.resize((w * scale, h * scale), Image.Resampling.NEAREST)
     img.save(path)
 
 

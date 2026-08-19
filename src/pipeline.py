@@ -1,9 +1,9 @@
 """AI 像素图像转换主流水线。
 
-将降噪、放大、锐化、网格检测与调色板量化等核心模块串联为一条完整流水线，
+将降噪、放大/缩小、锐化、网格检测与调色板量化等核心模块串联为一条完整流水线，
 支持整图一键运行以及按阶段增量执行（含前置依赖自动补齐与缓存失效重跑）。
 
-阶段顺序：``load → denoise_global → upscale → grid_detect → extract → palette_refine``
+阶段顺序：``load → denoise_global → resize → grid_detect → extract → palette_refine``
 
 主要接口：
 - ``PipelineParams``：流水线参数。
@@ -22,6 +22,7 @@ from PIL import Image
 from .utils import normalize_image
 from .core.io import to_gray
 from .core.denoise import denoise_ai_noise, apply_clahe
+from .core.aa_removal import remove_anti_aliasing as _remove_anti_aliasing
 from .core.grid_detect import (
     Grid,
     detect as _grid_detect,
@@ -59,6 +60,120 @@ def _unsharp_mask(img: np.ndarray, strength: float = 0.5, radius: int = 1) -> np
     return np.clip(sharpened, 0, 255).astype(np.float64)
 
 
+def _mean_grad_mag(img: np.ndarray) -> float:
+    """图像梯度幅值均值（|grad| 在 x/y 方向的平均），用于边缘能量估计。"""
+    a = np.asarray(img, dtype=np.float64)
+    gx = np.abs(np.diff(a, axis=1))  # (H, W-1, C)
+    gy = np.abs(np.diff(a, axis=0))  # (H-1, W, C)
+    return float((gx.sum() + gy.sum()) / (gx.size + gy.size))
+
+
+def _oklab_median_cut_palette(samples_rgb: np.ndarray, n_colors: int) -> np.ndarray:
+    """在 OKLab 空间对样本做 median-cut 聚类，返回簇代表色调色板。
+
+    与 ``core.color.extract_palette`` 的 RGB 中位切分不同，聚类在感知均匀的
+    OKLab 空间进行（等亮度异色可分），每个簇的代表色取**原始 RGB 均值**，
+    保证检测信号最终以 RGB 返回时色彩真实。
+
+    Args:
+        samples_rgb: ``(N, 3)`` RGB 0-255 样本数组。
+        n_colors: 目标调色板颜色数（实际簇数可因方差退化而更少）。
+
+    Returns:
+        ``(M, 3)`` uint8 调色板数组，``M <= n_colors``。
+    """
+    from .core.color import rgb_to_oklab
+
+    samples_rgb = np.asarray(samples_rgb, dtype=np.float64)
+    n = samples_rgb.shape[0]
+    if n == 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+
+    # OKLab 三通道统一系数缩放并平移到 [0,255] 附近（L 原始 [0,1]，
+    # a/b 原始约 [-0.4,0.4]；统一系数 255 保持 OKLab 欧氏度量的各向同性，
+    # 平移不影响基于方差/排序的中位切分）
+    oklab = rgb_to_oklab(samples_rgb)
+    scaled = oklab * 255.0 + np.array([0.0, 127.5, 127.5])
+
+    # 迭代 median-cut：优先分割方差最大的段（每轮对半分样本数）。
+    # 每段缓存各通道 sum/sumsq，方差用 E[x²]-E[x]² 增量维护，避免每轮
+    # 对全部样本重新做 fancy index + var 的大样本开销
+    def _seg_stats(seg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        sub = scaled[seg]
+        return sub.sum(axis=0), (sub * sub).sum(axis=0)
+
+    seg0 = np.arange(n)
+    s0, ss0 = _seg_stats(seg0)
+    segments: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = [(seg0, s0, ss0)]
+    while len(segments) < n_colors:
+        best_i, best_var, best_ch = -1, -1.0, 0
+        for i, (seg, s, ss) in enumerate(segments):
+            m = seg.shape[0]
+            if m <= 1:
+                continue
+            var = ss / m - (s / m) ** 2
+            ch = int(np.argmax(var))
+            if var[ch] > best_var:
+                best_i, best_var, best_ch = i, float(var[ch]), ch
+        if best_i < 0 or best_var < 1e-12:
+            break  # 所有段方差退化（同色簇），无法继续分割
+        seg, _, _ = segments.pop(best_i)
+        order = np.argsort(scaled[seg][:, best_ch])  # 快排即可，等值分割位置不影响簇质量
+        seg_sorted = seg[order]
+        sub_sorted = scaled[seg_sorted]
+        mid = seg_sorted.shape[0] // 2
+        left, right = seg_sorted[:mid], seg_sorted[mid:]
+        lsub, rsub = sub_sorted[:mid], sub_sorted[mid:]
+        segments.insert(best_i, (right, rsub.sum(axis=0), (rsub * rsub).sum(axis=0)))
+        segments.insert(best_i, (left, lsub.sum(axis=0), (lsub * lsub).sum(axis=0)))
+
+    # 每簇取原始 RGB 均值为代表色（色彩真实）
+    palette = np.stack([
+        samples_rgb[seg].mean(axis=0) for seg, _, _ in segments if seg.shape[0] > 0
+    ])
+    return np.clip(np.round(palette), 0, 255).astype(np.uint8)
+
+
+def _quantize_detection_signal(img: np.ndarray, n_colors: int = 16) -> np.ndarray:
+    """对检测信号做 OKLab 空间小调色板量化，仅用于网格检测（不改变提取信号）。
+
+    流程：全图 1/16 子采样 → 样本转 OKLab 做 median-cut 聚类（感知空间
+    聚类使等亮度异色块可分）→ 每簇取原始 RGB 均值为调色板色 → 全图在
+    OKLab 空间用 cKDTree 最近邻映射。量化把 AA 过渡带阶跃化（块边界
+    色差能量集中）、块内渐变坍缩为零梯度，提升网格检测的边界可检测性。
+
+    Args:
+        img: ``(H, W, 3)`` RGB 0-255 图像数组。
+        n_colors: 调色板颜色数。
+
+    Returns:
+        ``(H, W, 3)`` uint8 量化后图像；退化输入（非 3 通道/空图）原样返回。
+    """
+    from scipy.spatial import cKDTree
+
+    from .core.color import rgb_to_oklab
+
+    u8 = np.clip(np.asarray(img, dtype=np.float64), 0, 255).astype(np.uint8)
+    if u8.ndim != 3 or u8.shape[2] != 3 or u8.shape[0] == 0 or u8.shape[1] == 0:
+        return u8  # 退化输入安全回退
+    H, W = u8.shape[:2]
+    n_colors = max(1, int(n_colors))
+
+    # 子采样（约 1/16，2K 图约 26 万样本）构建调色板
+    pixels = u8.reshape(-1, 3)
+    samples = pixels[::16]
+    if samples.shape[0] == 0:
+        samples = pixels  # 极小图回退全采样
+    palette = _oklab_median_cut_palette(samples, n_colors)
+
+    # 全图 OKLab 最近邻映射（float32 + 多线程 query 加速，最近邻判定精度足够；
+    # 直接传 u8 由 rgb_to_oklab 内部一次性转 float64，避免额外 100MB 副本）
+    oklab_full = rgb_to_oklab(u8).reshape(-1, 3)
+    tree = cKDTree(rgb_to_oklab(palette.astype(np.float64)))
+    indices = tree.query(oklab_full.astype(np.float32), workers=-1)[1]
+    return palette[indices].reshape(H, W, 3)
+
+
 @dataclass
 class PipelineParams:
     """流水线参数。
@@ -69,13 +184,21 @@ class PipelineParams:
         ai_denoise_strength: 去噪强度，0.0-1.0。
         enable_clahe: 降噪后是否启用 CLAHE 局部对比度增强。
         clahe_clip_limit: CLAHE 裁剪限制（0.01-0.1）。
-        enable_upscale: 是否在降噪后启用双线性放大以提升网格检测分辨率。
+        enable_upscale: 是否在降噪后启用放大以提升网格检测分辨率。
         upscale_factor: 放大倍数（默认 2）。
         upscale_method: 放大算法，``"nearest"``/``"bilinear"``/``"bicubic"``/``"lanczos"``。
         enable_sharpen: 是否对放大结果做 unsharp mask 锐化（默认关闭，因有白边风险）。
         sharpen_strength: 锐化强度，0.0-1.0。
+        enable_aa_removal: 降噪后是否启用抗锯齿消除预处理（默认关闭）。
+        aa_removal_passes: AA 消除迭代次数。
+        aa_removal_threshold: AA 消除两主色距离阈值。
+        denoise_grid_guard: 降噪-检测耦合保护：去噪后若边缘能量衰减过度，
+            自动减半强度重去噪一次（默认关闭）。
         min_p: 网格检测最小候选周期。
         max_p: 网格检测最大候选周期。
+        detect_signal: 网格检测信号模式，``"gray"``（BT.601 灰度）或
+            ``"oklab"``（OKLAB 感知色差，等亮度异色块边界可见），默认 gray。
+        enable_pre_quantize: 网格检测前是否对检测信号做小调色板预量化（默认关闭）。
         user_hint: 用户给定的逻辑分辨率提示 ``(w, h)``，非 None 时优先使用。
         phase_step: 相位扫描步长。
         snr_threshold: 网格检测 SNR 阈值，低于此值判定为无网格。
@@ -83,6 +206,16 @@ class PipelineParams:
         enable_subpixel_refine: 是否启用亚像素精炼。
         smooth_strength: 全局正则化混合强度（0.0=纯观测，1.0=完全用全局线性模型）。
         outlier_reject_ratio: 网格检测离群间距剔除阈值比例。
+        enable_peak_lattice_fit: 投票周期确定后用峰值格点拟合精化为浮点周期，
+            支持非整数块尺寸如 7.5px；失败自动回退投票值；附轴一致性防护
+            （精化前两轴一致而精化后分裂 >2% 时整体回退投票值），默认开启。
+        enable_comb_energy_score: 梳状能量集中度终审（G2）：对投影信号做
+            连续 (pitch, phase) 梳状打分，原理性压制子谐波/倍频误检（子谐波
+            覆盖惩罚翻倍、倍频能量减半，必然低于真周期）；低置信自动回退
+            投票结果（默认开启）。
+        jpeg_grid_guard: JPEG 8×8 压缩网格检测与候选降权（G5）：检测 JPEG
+            8×8 DCT 网格并对 8/16/24px 附近候选降权，防护压缩伪影周期误检
+            （默认开启）。
         extract_method: 块提取代表色算法，``"median"``/``"mean"``/``"mode"``/``"kmeans"``。
         extract_core_ratio: 块核心区采样比例（0.5-1.0），规避边缘杂色。
         fix_square: 当逻辑分辨率与正方形差 1 时，自动修正为正方形输出。
@@ -97,14 +230,22 @@ class PipelineParams:
     enable_clahe: bool = False               # 降噪后是否启用 CLAHE 局部对比度增强
     clahe_clip_limit: float = 0.03           # CLAHE 裁剪限制（0.01-0.1）
     # 放大与锐化
-    enable_upscale: bool = False               # 降噪后是否双线性放大
+    enable_upscale: bool = False               # 降噪后是否放大
     upscale_factor: int = 2                    # 放大倍数
-    upscale_method: str = "bilinear"          # 放大算法："nearest"/"bilinear"/"bicubic"/"lanczos"
+    upscale_method: str = "nearest"          # 放大算法："nearest"/"bilinear"/"bicubic"/"lanczos"
     enable_sharpen: bool = False               # 是否启用 unsharp mask 锐化（默认关闭）
     sharpen_strength: float = 0.5              # 锐化强度 0.0-1.0
+    # 抗锯齿消除（默认关闭）
+    enable_aa_removal: bool = False            # 降噪后是否启用 AA 消除预处理
+    aa_removal_passes: int = 2                 # AA 消除迭代次数
+    aa_removal_threshold: float = 0.5          # AA 消除两主色距离阈值
+    # 去噪-检测耦合保护（默认关闭）
+    denoise_grid_guard: bool = False           # 去噪过强时自动减半强度重去噪一次
     # 网格检测
     min_p: int = 3
     max_p: int = 40
+    detect_signal: str = "gray"          # 检测信号模式："gray"/"oklab"
+    enable_pre_quantize: bool = False          # 检测前对检测信号做小调色板预量化
     user_hint: Optional[tuple[int, int]] = None
     phase_step: float = 0.1
     snr_threshold: float = 8.0           # 网格检测 SNR 阈值
@@ -112,8 +253,11 @@ class PipelineParams:
     enable_subpixel_refine: bool = True     # 是否启用亚像素精炼
     smooth_strength: float = 0.5            # 全局平滑约束强度（0.0-1.0）
     outlier_reject_ratio: float = 0.5             # 网格检测离群间距剔除阈值比例
+    enable_peak_lattice_fit: bool = True     # 投票后峰值格点拟合周期精化（默认开启，含轴一致性防护）
+    enable_comb_energy_score: bool = True    # 梳状能量集中度周期终审（默认开启）
+    jpeg_grid_guard: bool = True             # JPEG 8×8 网格检测与候选降权（默认开启）
     # 块提取
-    extract_method: str = "kmeans"              # "median"/"mean"/"mode"/"kmeans"
+    extract_method: str = "median"              # "median"/"mean"/"mode"/"kmeans"
     extract_core_ratio: float = 0.6            # 0.5-1.0
     # 正方形修正
     fix_square: bool = False
@@ -148,14 +292,14 @@ class Pipeline:
     """
 
     STAGES = (
-        "load", "denoise_global", "upscale", "grid_detect", "extract", "palette_refine",
+        "load", "denoise_global", "resize", "grid_detect", "extract", "palette_refine",
     )
     PREREQS = {
         "load": (),
         "denoise_global": ("load",),
-        "upscale": ("denoise_global",),
-        "grid_detect": ("upscale",),
-        "extract": ("upscale", "grid_detect"),
+        "resize": ("denoise_global",),
+        "grid_detect": ("resize",),
+        "extract": ("resize", "grid_detect"),
         "palette_refine": ("extract",),
     }
 
@@ -212,16 +356,32 @@ class Pipeline:
             denoised = denoise_ai_noise(
                 img, method=p.ai_denoise_method, strength=p.ai_denoise_strength
             )
+            # 去噪-检测耦合保护：去噪过度破坏网格结构时，减半强度重去噪一次
+            if p.denoise_grid_guard and p.ai_denoise_strength > 0:
+                r = _mean_grad_mag(denoised) / max(_mean_grad_mag(img), 1e-9)
+                if r < 0.4:
+                    denoised = denoise_ai_noise(
+                        img, method=p.ai_denoise_method,
+                        strength=p.ai_denoise_strength / 2.0,
+                    )
         else:
             denoised = img
+        # 可选抗锯齿消除（默认关闭）：清理块边界/网格线 AA 混合杂色
+        if p.enable_aa_removal:
+            denoised = _remove_anti_aliasing(
+                denoised,
+                threshold=p.aa_removal_threshold,
+                passes=p.aa_removal_passes,
+            )
         if p.enable_clahe and p.clahe_clip_limit > 0:
             denoised = apply_clahe(denoised, clip_limit=p.clahe_clip_limit)
         self._cache["denoise_global"] = denoised
         self._stage_done.add("denoise_global")
 
-    def _run_upscale(self) -> None:
+    def _run_resize(self) -> None:
         img = self._cache["denoise_global"]
         p = self.params
+        # 顺序：先放大（提升网格检测分辨率），再可选锐化
         if p.enable_upscale and p.upscale_factor > 1:
             H, W = img.shape[:2]
             f = int(p.upscale_factor)
@@ -236,40 +396,58 @@ class Pipeline:
                 )
         else:
             result = img
-        # 可选锐化（unsharp mask）
+        # 可选锐化（unsharp mask），仍在放大后
         if p.enable_sharpen and p.sharpen_strength > 0:
             result = _unsharp_mask(result, strength=p.sharpen_strength)
-        self._cache["upscale"] = result
-        self._stage_done.add("upscale")
+        self._cache["resize"] = result
+        self._stage_done.add("resize")
 
     def _run_grid_detect(self) -> None:
-        img = self._cache["upscale"]
+        img = self._cache["resize"]
         p = self.params
 
-        gray = to_gray(img)
+        # oklab 色差模式：RGB 直传（预量化若开启则先量化再传），色差信号在
+        # detect 内部计算；2D 输入或 gray 模式保持原灰度路径不变
+        use_oklab = p.detect_signal == "oklab" and img.ndim == 3
+        if use_oklab:
+            detect_input = _quantize_detection_signal(img, n_colors=16) if p.enable_pre_quantize else img
+            # stages 缓存 "gray" 语义与灰度模式一致：缓存检测信号的 BT.601 灰度
+            gray = to_gray(detect_input)
+            signal = "oklab"
+        else:
+            gray = to_gray(img)
+            # 可选预量化：仅对"检测信号"做小调色板量化，提升低对比度边缘可检测性
+            if p.enable_pre_quantize:
+                gray = to_gray(_quantize_detection_signal(img, n_colors=16))
+            detect_input = gray
+            signal = "gray"
 
         if self._user_grid:
             w, h = self._user_grid
-            grid = _grid_detect_user(gray, w, h, step=p.phase_step)
+            grid = _grid_detect_user(detect_input, w, h, step=p.phase_step, signal=signal)
         elif p.user_hint:
-            grid = _grid_detect_user(gray, *p.user_hint, step=p.phase_step)
+            grid = _grid_detect_user(detect_input, *p.user_hint, step=p.phase_step, signal=signal)
         else:
             grid = _grid_detect(
-                gray, min_p=p.min_p, max_p=p.max_p, step=p.phase_step,
+                detect_input, min_p=p.min_p, max_p=p.max_p, step=p.phase_step,
                 snr_threshold=p.snr_threshold,
                 edge_tol=p.edge_search_tolerance,
                 enable_subpixel_refine=p.enable_subpixel_refine,
                 smooth_strength=p.smooth_strength,
                 outlier_reject_ratio=p.outlier_reject_ratio,
+                signal=signal,
+                enable_peak_lattice_fit=p.enable_peak_lattice_fit,
+                enable_comb_energy_score=p.enable_comb_energy_score,
+                jpeg_grid_guard=p.jpeg_grid_guard,
             )
 
-        # grid 坐标在放大图坐标系，extract 也用放大图，无需映射回原图
+        # grid 坐标在 resize 图坐标系，extract 也用 resize 图，无需映射回原图
         self._cache["grid_detect"] = grid
         self._cache["gray"] = gray  # 复用已计算的灰度，避免重复 to_gray（B12）
         self._stage_done.add("grid_detect")
 
     def _run_extract(self) -> None:
-        img = self._cache["upscale"]
+        img = self._cache["resize"]
         grid = self._cache["grid_detect"]
         p = self.params
         extracted = _extract_blocks(
@@ -335,6 +513,7 @@ class Pipeline:
             "px": grid.px,
             "py": grid.py,
             "grid_conf": grid.conf,
+            "low_confidence": grid.low_confidence,
             "unique_colors": unique_colors,
             "extract_method": self.params.extract_method,
         }
@@ -432,7 +611,7 @@ class Pipeline:
         runners = {
             "load": self._run_load,
             "denoise_global": self._run_denoise_global,
-            "upscale": self._run_upscale,
+            "resize": self._run_resize,
             "grid_detect": self._run_grid_detect,
             "extract": self._run_extract,
             "palette_refine": self._run_palette_refine,

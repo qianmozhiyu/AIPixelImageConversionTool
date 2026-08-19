@@ -30,7 +30,7 @@ AI生成的像素图2
 （部分 AI 生成的像素图转换仍存在误差，算法持续优化中）
 （Some AI‑generated pixel art may produce imperfect conversion results. The algorithm will be continuously optimized）
 ### 处理流程
-`输入图像 → 降噪 →（可选放大）→ 网格检测 → 块提取 → 调色板精炼 → 标准像素图`
+`输入图像 → 降噪 →（可选调整大小：放大）→ 网格检测 → 块提取 → 调色板精炼 → 标准像素图`
 
 ### 文档
 - [核心算法与流水线](docs/CORE_PIPELINE_ALGORITHMS.md)
@@ -49,7 +49,7 @@ AI生成的像素图2
 >Provide simple editing functions to manually fix imperfect conversion results.
 
 ### Workflow
-`Input Image → Denoise → (Optional Upscale) → Grid Detection → Block Extraction → Palette Refinement → Standard Pixel Art`
+`Input Image → Denoise → (Optional Resize: Upscale) → Grid Detection → Block Extraction → Palette Refinement → Standard Pixel Art`
 
 ### Documents
 - [Core Pipeline & Algorithms](docs/CORE_PIPELINE_ALGORITHMS.md)
