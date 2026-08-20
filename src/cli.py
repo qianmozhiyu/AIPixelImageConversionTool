@@ -102,6 +102,16 @@ def main(argv: list[str] | None = None) -> int:
         help="放大算法（默认nearest）",
     )
     parser.add_argument(
+        "--detect-max-size",
+        type=int,
+        default=2048,
+        help=(
+            "网格检测输入图的最大边长（像素，默认2048）：放大后图像超过该值时，"
+            "网格检测改在放大前的图像上执行，检测完成后网格坐标按缩放比映射回"
+            "放大坐标系，保证大图放大路径的检测性能；未超限时仍在放大图上检测"
+        ),
+    )
+    parser.add_argument(
         "--no-sharpen",
         action="store_true",
         help="禁用放大后的 unsharp mask 锐化（默认关闭，启用锐化需显式开启）",
@@ -232,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_upscale=args.upscale and not args.no_upscale,
         upscale_factor=args.upscale_factor,
         upscale_method=args.upscale_method,
+        detect_max_size=args.detect_max_size,
         enable_sharpen=args.sharpen and not args.no_sharpen,
         sharpen_strength=args.sharpen_strength,
         enable_palette_refine=not args.no_palette_refine,

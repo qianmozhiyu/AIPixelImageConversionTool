@@ -9,15 +9,15 @@ from __future__ import annotations
 import numpy as np
 from collections import deque
 
-from PySide6.QtCore import Qt, Signal, QPoint, QRect
+from PySide6.QtCore import Qt, Signal, QPoint, QPointF, QRect, QRectF
 from PySide6.QtGui import (
-    QImage, QPainter, QPixmap, QColor, QPen, QMouseEvent, QKeyEvent,
+    QImage, QPainter, QPixmap, QColor, QPen, QBrush, QMouseEvent, QKeyEvent,
     QAction, QKeySequence, QIcon,
 )
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QSpinBox, QColorDialog, QScrollArea, QFrame, QToolBar, QStatusBar,
-    QToolButton, QButtonGroup, QCheckBox,
+    QToolButton, QButtonGroup, QCheckBox, QComboBox,
 )
 
 from ..core.asset_manager import AssetManager
@@ -30,10 +30,12 @@ class PixelCanvas(QWidget):
     Signals:
         pixel_edited(): 像素被编辑（用于刷新颜色按钮等）
         stroke_started(): 一次绘制笔画开始（用于压入撤销栈）
+        cursor_moved(): 光标在画布上移动/离开（用于状态栏更新）
     """
 
     pixel_edited = Signal()
     stroke_started = Signal()
+    cursor_moved = Signal()
 
     # 工具枚举
     TOOL_BRUSH = "brush"
@@ -42,6 +44,8 @@ class PixelCanvas(QWidget):
     TOOL_FILL = "fill"
     TOOL_LINE = "line"
     TOOL_RECT = "rect"
+    TOOL_CIRCLE = "circle"
+    TOOL_SELECT = "select"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -52,6 +56,9 @@ class PixelCanvas(QWidget):
         self._fg_color = QColor(0, 0, 0, 255)
         self._bg_color = QColor(255, 255, 255, 255)
         self._brush_size = 1
+        self._brush_shape = "circle"  # 笔刷形状：circle=圆形（默认）/ square=方形
+        self._grid_visible = True     # 是否显示像素网格
+        self._symmetry = "none"       # 对称模式：none/horizontal/vertical/both
         self._drawing = False
         self._alt_picking = False  # 按住 Alt 临时吸管取色中
         self._shift_line = False   # 按住 Shift 临时直线工具中
@@ -60,8 +67,24 @@ class PixelCanvas(QWidget):
         self._pan_start = QPoint()
         self._offset_start = QPoint()
         self._space_pressed = False
-        self._temp_preview: np.ndarray | None = None  # 直线/矩形预览
-        self._hover_pixel: QPoint | None = None  # 当前鼠标所在像素（用于十字光标）
+        self._right_picking = False  # 按住右键连续取背景色中
+        self._temp_preview: np.ndarray | None = None  # 直线/矩形/圆形预览
+        self._hover_pixel: QPoint | None = None  # 当前鼠标所在像素（取整，供状态栏）
+        self._cursor_pos: QPointF | None = None  # 光标像素坐标（浮点，完全跟随鼠标，不取整）
+        # 框选工具状态：选区（像素矩形）+ 拖动中标记 + 内部像素剪贴板
+        self._selection: QRect | None = None  # 当前选区（像素坐标）；None=无选区
+        self._selecting = False              # 正在拖拽框选选区
+        self._selection_start = QPoint()     # 框选起始像素
+        self._clipboard: np.ndarray | None = None  # 复制的选区内容 (h,w,4) RGBA
+        # 选区拖动（携内容移动）：快照法保留撤回到原始
+        self._select_move = False            # 正在拖动选区内容
+        self._move_start = QPoint()          # 拖动起点像素
+        self._move_anchor = QPoint()         # 拖动前选区左上角
+        self._move_snap: np.ndarray | None = None  # 拖动前图像快照
+        self._move_src: QRect | None = None        # 拖动前选区（内容来源）
+        # 性能：QImage 缓存避免每帧重建；棋盘格背景用于标识透明区域
+        self._qimage: QImage | None = None
+        self._checker: QPixmap = self._make_checkerboard()
         # 完美像素（Aseprite 风格，默认开启）：绘制时自动消除 2px 宽对角伪影
         self._perfect_pixel = True
         self._pp_prev: QPoint | None = None  # 笔画窗口：三元组中的前一点
@@ -84,7 +107,12 @@ class PixelCanvas(QWidget):
         else:
             self._image = np.clip(image, 0, 255).astype(np.uint8)
         self._temp_preview = None
+        self._qimage = None  # 图像内容变化，缓存失效
         self.update()
+
+    def _invalidate_qimage(self) -> None:
+        """标记 QImage 缓存失效（图像内容变化时调用）。"""
+        self._qimage = None
 
     def get_image(self) -> np.ndarray | None:
         """获取当前图像（RGB）。"""
@@ -121,6 +149,40 @@ class PixelCanvas(QWidget):
     def get_brush_size(self) -> int:
         return self._brush_size
 
+    def set_brush_shape(self, shape: str) -> None:
+        """设置笔刷形状："square"（方形）或 "circle"（圆形）。"""
+        if shape in ("square", "circle"):
+            self._brush_shape = shape
+            self.update()
+
+    def get_brush_shape(self) -> str:
+        return self._brush_shape
+
+    def set_grid_visible(self, visible: bool) -> None:
+        """开关像素网格显示。"""
+        self._grid_visible = bool(visible)
+        self.update()
+
+    def get_grid_visible(self) -> bool:
+        return self._grid_visible
+
+    @staticmethod
+    def _circle_offsets(size: int) -> list:
+        """返回以 (0,0) 为中心、直径 size 的圆盘内全部 (dx,dy) 偏移列表。
+
+        覆盖面半径取 half = size//2（与 spec 一致）；size=1 时退化为单像素 (0,0)。
+        """
+        if size <= 1:
+            return [(0, 0)]
+        half = size // 2
+        r2 = half * half
+        return [
+            (dx, dy)
+            for dy in range(-half, half + 1)
+            for dx in range(-half, half + 1)
+            if dx * dx + dy * dy <= r2 + 0.5
+        ]
+
     def set_perfect_pixel(self, enabled: bool) -> None:
         """启用/禁用完美像素（Aseprite 风格，默认开启）。"""
         self._perfect_pixel = bool(enabled)
@@ -131,6 +193,17 @@ class PixelCanvas(QWidget):
 
     def get_perfect_pixel(self) -> bool:
         return self._perfect_pixel
+
+    @staticmethod
+    def _make_checkerboard() -> QPixmap:
+        """生成 16x16 棋盘格 QPixmap（浅灰白格，透明区域用经典棋盘底色）。"""
+        pm = QPixmap(16, 16)
+        pm.fill(QColor("#d0d0d0"))
+        p = QPainter(pm)
+        p.fillRect(QRect(0, 0, 8, 8), QColor("#ffffff"))
+        p.fillRect(QRect(8, 8, 8, 8), QColor("#ffffff"))
+        p.end()
+        return pm
 
     @staticmethod
     def _line_points(p0: QPoint, p1: QPoint) -> list:
@@ -201,26 +274,62 @@ class PixelCanvas(QWidget):
         """将控件坐标转换为像素坐标。"""
         if self._image is None:
             return None
-        px = (pos.x() - self._offset.x()) // self._scale
-        py = (pos.y() - self._offset.y()) // self._scale
+        px = (pos.x() - self._offset.x()) // self._cell_size()
+        py = (pos.y() - self._offset.y()) // self._cell_size()
         h, w = self._image.shape[:2]
         if 0 <= px < w and 0 <= py < h:
             return QPoint(px, py)
         return None
 
+    def _mirror_point(self, x: int, y: int, w: int, h: int) -> list:
+        """返回 (x,y) 经对称轴镜像产生的额外坐标列表（不含原坐标）。
+
+        水平 horizontal = 关于垂直中线左右镜像（x→w-1-x，Aseprite 语义），
+        垂直 vertical = 关于水平中线上下镜像，both = 四种对称。
+        """
+        pts = []
+        if self._symmetry == "horizontal":
+            pts.append((w - 1 - x, y))
+        elif self._symmetry == "vertical":
+            pts.append((x, h - 1 - y))
+        elif self._symmetry == "both":
+            pts.append((w - 1 - x, y))
+            pts.append((x, h - 1 - y))
+            pts.append((w - 1 - x, h - 1 - y))
+        return pts
+
     def _draw_pixel(self, x: int, y: int, color: QColor, img: np.ndarray | None = None) -> None:
-        """在指定位置绘制像素（考虑笔刷大小）。"""
+        """在指定位置绘制像素（考虑笔刷大小与形状、对称）。"""
         target = img if img is not None else self._image
         if target is None:
             return
         h, w = target.shape[:2]
         size = self._brush_size
         half = size // 2
-        for dy in range(-half, size - half):
-            for dx in range(-half, size - half):
-                nx, ny = x + dx, y + dy
+
+        # 根据笔刷形状收集覆盖偏移：方形用双循环矩形，圆形用圆盘偏移集
+        if self._brush_shape == "circle":
+            offsets = self._circle_offsets(size)
+        else:
+            offsets = [
+                (dx, dy)
+                for dy in range(-half, size - half)
+                for dx in range(-half, size - half)
+            ]
+
+        # 对称：汇总原落笔点与所有镜像点作为覆盖中心
+        centers = [(x, y)]
+        if self._symmetry != "none":
+            centers.extend(self._mirror_point(x, y, w, h))
+
+        rgba = [color.red(), color.green(), color.blue(), color.alpha()]
+        for (cx, cy) in centers:
+            for (dx, dy) in offsets:
+                nx, ny = cx + dx, cy + dy
                 if 0 <= nx < w and 0 <= ny < h:
-                    target[ny, nx] = [color.red(), color.green(), color.blue(), color.alpha()]
+                    target[ny, nx] = rgba
+        if target is self._image:
+            self._qimage = None  # 图像内容变化，缓存失效
 
     def _pick_color(self, pos: QPoint) -> None:
         """吸管取色：将像素坐标处的颜色设为前景色。"""
@@ -230,6 +339,22 @@ class PixelCanvas(QWidget):
         if not (0 <= pos.x() < w and 0 <= pos.y() < h):
             return
         self._fg_color = QColor(*self._image[pos.y(), pos.x()])
+        self.pixel_edited.emit()
+        self.update()
+
+    def _pick_bg_color(self, pos: QPoint) -> None:
+        """右键取背景：将像素坐标处的颜色设为背景色。"""
+        if self._image is None or pos is None:
+            return
+        h, w = self._image.shape[:2]
+        if not (0 <= pos.x() < w and 0 <= pos.y() < h):
+            return
+        self._bg_color = QColor(*self._image[pos.y(), pos.x()])
+        self.pixel_edited.emit()
+
+    def swap_colors(self) -> None:
+        """交换前景色与背景色（X 快捷键）。"""
+        self._fg_color, self._bg_color = self._bg_color, self._fg_color
         self.pixel_edited.emit()
         self.update()
 
@@ -259,6 +384,40 @@ class PixelCanvas(QWidget):
         self._draw_line_bresenham(x1, y1, x0, y1, color, img)
         self._draw_line_bresenham(x0, y1, x0, y0, color, img)
 
+    def _draw_circle_midpoint(self, x0: int, y0: int, x1: int, y1: int, color: QColor, img: np.ndarray) -> None:
+        """以 (x0,y0)-(x1,y1) 外接矩形中心为圆心绘制 1px 圆环。
+
+        圆心 = 外接矩形中心，半径 = max(|dx|,|dy|)/2。
+        """
+        import math
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        r = max(abs(x1 - x0), abs(y1 - y0)) / 2.0
+        if r < 1:
+            self._draw_pixel(int(round(cx)), int(round(cy)), color, img)
+            return
+        r2 = r * r
+        for py in range(int(cy) - int(r) - 1, int(cy) + int(r) + 2):
+            for px in range(int(cx) - int(r) - 1, int(cx) + int(r) + 2):
+                dist = math.sqrt((px - cx) ** 2 + (py - cy) ** 2)
+                if abs(dist - r) <= 0.5:
+                    self._draw_pixel(px, py, color, img)
+
+    def set_symmetry(self, mode: str) -> None:
+        """设置对称模式："none"/"horizontal"/"vertical"/"both"。"""
+        if mode in ("none", "horizontal", "vertical", "both"):
+            self._symmetry = mode
+            self.update()
+
+    def get_symmetry(self) -> str:
+        return self._symmetry
+
+    def cycle_symmetry(self) -> None:
+        """循环切换对称模式（Shift+S）。"""
+        order = ("none", "horizontal", "vertical", "both")
+        self._symmetry = order[(order.index(self._symmetry) + 1) % len(order)]
+        self.update()
+
     def _flood_fill(self, x: int, y: int, fill_color: QColor) -> None:
         """洪水填充连通同色区域。"""
         if self._image is None:
@@ -280,6 +439,108 @@ class PixelCanvas(QWidget):
             queue.append((cx - 1, cy))
             queue.append((cx, cy + 1))
             queue.append((cx, cy - 1))
+        self._qimage = None  # 图像内容变化，缓存失效
+
+    # ------------------------------------------------------------------
+    # 框选工具：选区访问 + 复制/粘贴/翻转（水平/垂直镜像）
+    # ------------------------------------------------------------------
+    def get_selection(self) -> QRect | None:
+        """返回当前选区（像素坐标），无选区返回 None。"""
+        return QRect(self._selection) if self._selection else None
+
+    def _cell_size(self) -> int:
+        """返回整数像素格尺寸（所有像素↔控件换算统一用它，避免 float scale 歧义）。"""
+        return max(1, int(round(self._scale)))
+
+    def clear_selection(self) -> None:
+        """清除选区。"""
+        self._selection = None
+        self.update()
+
+    def _clamped_selection(self) -> tuple[int, int, int, int] | None:
+        """返回裁剪到画布边界的选区 (y0, x0, y1, x1)；无效返回 None。"""
+        if self._image is None or self._selection is None:
+            return None
+        h, w = self._image.shape[:2]
+        y0 = max(0, self._selection.y())
+        x0 = max(0, self._selection.x())
+        y1 = min(h, self._selection.y() + self._selection.height())
+        x1 = min(w, self._selection.x() + self._selection.width())
+        if y1 <= y0 or x1 <= x0:
+            return None
+        return (y0, x0, y1, x1)
+
+    def copy_selection(self) -> None:
+        """把选区内容复制到内部像素剪贴板（RGBA）。无选区则清除剪贴板。"""
+        b = self._clamped_selection()
+        if b is None:
+            self._clipboard = None
+            return
+        y0, x0, y1, x1 = b
+        self._clipboard = self._image[y0:y1, x0:x1].copy()
+
+    def clipboard_has(self) -> bool:
+        return self._clipboard is not None
+
+    def paste_clipboard(self) -> None:
+        """把剪贴板内容粘贴到当前选区左上角（无选区则贴到 (0,0)），边界裁剪。"""
+        if self._image is None or self._clipboard is None:
+            return
+        h, w = self._image.shape[:2]
+        ch, cw = self._clipboard.shape[:2]
+        if self._selection is not None:
+            ax, ay = self._selection.x(), self._selection.y()
+        else:
+            ax, ay = 0, 0
+        py0 = max(0, ay)
+        px0 = max(0, ax)
+        py1 = min(h, ay + ch)
+        px1 = min(w, ax + cw)
+        if py1 <= py0 or px1 <= px0:
+            return
+        self._image[py0:py1, px0:px1] = self._clipboard[: py1 - py0, : px1 - px0]
+        self._qimage = None
+        self.pixel_edited.emit()
+        self.stroke_started.emit()  # 粘贴视为一笔，可撤销
+        self.update()
+
+    def flip_selection_horizontal(self) -> None:
+        """水平翻转（左右镜像）选区内容并写回。"""
+        b = self._clamped_selection()
+        if b is None:
+            return
+        y0, x0, y1, x1 = b
+        self._image[y0:y1, x0:x1] = self._image[y0:y1, x0:x1][:, ::-1].copy()
+        self._qimage = None
+        self.pixel_edited.emit()
+        self.stroke_started.emit()
+        self.update()
+
+    def flip_selection_vertical(self) -> None:
+        """垂直翻转（上下镜像）选区内容并写回。"""
+        b = self._clamped_selection()
+        if b is None:
+            return
+        y0, x0, y1, x1 = b
+        self._image[y0:y1, x0:x1] = self._image[y0:y1, x0:x1][::-1, :].copy()
+        self._qimage = None
+        self.pixel_edited.emit()
+        self.stroke_started.emit()
+        self.update()
+
+    def cut_selection(self) -> None:
+        """剪切：把选区内容复制到剪贴板，并将选区像素清为透明。"""
+        b = self._clamped_selection()
+        if b is None:
+            self._clipboard = None
+            return
+        y0, x0, y1, x1 = b
+        self._clipboard = self._image[y0:y1, x0:x1].copy()
+        self._image[y0:y1, x0:x1] = [0, 0, 0, 0]
+        self._qimage = None
+        self.pixel_edited.emit()
+        self.stroke_started.emit()  # 剪切改写图像，可撤销
+        self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if self._image is None:
@@ -293,6 +554,21 @@ class PixelCanvas(QWidget):
         pos = self._widget_to_pixel(event.position().toPoint())
         if pos is None:
             return
+        # 按下瞬间同步光标与落子格，保证笔刷预览 == 本次落子的格子（无偏移）
+        self._hover_pixel = QPoint(pos)
+        e = event.position()
+        self._cursor_pos = QPointF(
+            (e.x() - self._offset.x()) / self._cell_size(),
+            (e.y() - self._offset.y()) / self._cell_size(),
+        )
+
+        if event.button() == Qt.MouseButton.RightButton:
+            # 右键取背景色：按住右键拖动可连续取背景
+            self._drawing = True
+            self._right_picking = True
+            self._pick_bg_color(pos)
+            self.update()
+            return
 
         if event.button() == Qt.MouseButton.LeftButton:
             if event.modifiers() & Qt.KeyboardModifier.AltModifier:
@@ -304,9 +580,9 @@ class PixelCanvas(QWidget):
                 self._pick_color(pos)
                 return
 
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier and self._tool != self.TOOL_CIRCLE:
                 # 按住 Shift = 临时直线工具（与 Alt 吸管同理，不修改 self._tool；
-                # 按下左键开始预览，松开左键提交）
+                # 按下左键开始预览，松开左键提交）；圆形工具下 Shift 用于锁定正圆
                 self._drawing = True
                 self._shift_line = True
                 self._temp_preview = self._image.copy()
@@ -337,14 +613,37 @@ class PixelCanvas(QWidget):
             elif self._tool == self.TOOL_FILL:
                 self._flood_fill(pos.x(), pos.y(), self._fg_color)
                 self.pixel_edited.emit()
-            elif self._tool in (self.TOOL_LINE, self.TOOL_RECT):
+            elif self._tool in (self.TOOL_LINE, self.TOOL_RECT, self.TOOL_CIRCLE):
                 # 开始预览
                 self._temp_preview = self._image.copy()
+            elif self._tool == self.TOOL_SELECT:
+                if self._selection is not None and self._selection.contains(pos):
+                    # 点击在现有选区内：开始拖动（携内容移动）
+                    self._select_move = True
+                    self._drawing = True
+                    self._move_snap = self._image.copy()
+                    self._move_src = QRect(self._selection)
+                    self._move_start = QPoint(pos)
+                    self._move_anchor = QPoint(self._selection.topLeft())
+                    self.update()
+                else:
+                    # 点击在选区外/空白：开始拖拽新建选区
+                    self._selecting = True
+                    self._selection_start = QPoint(pos)
+                    self._selection = QRect(pos.x(), pos.y(), 1, 1)
+                    self.update()
             self.update()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         # 更新笔刷范围框位置（无论是否在绘制/平移都跟随光标）
+        # 记录光标像素坐标（浮点，完全跟随鼠标不取整）与取整像素（供状态栏）
+        pos_px = event.position()
+        self._cursor_pos = QPointF(
+            (pos_px.x() - self._offset.x()) / self._cell_size(),
+            (pos_px.y() - self._offset.y()) / self._cell_size(),
+        )
         self._hover_pixel = self._widget_to_pixel(event.position().toPoint())
+        self.cursor_moved.emit()  # 状态栏刷新（无图像时同样发一次以复位"就绪"）
         self.update()
 
         if self._panning:
@@ -358,6 +657,13 @@ class PixelCanvas(QWidget):
             pos = self._widget_to_pixel(event.position().toPoint())
             if pos is not None:
                 self._pick_color(pos)
+            return
+
+        if self._right_picking:
+            # 按住右键拖动：连续取背景色
+            pos = self._widget_to_pixel(event.position().toPoint())
+            if pos is not None:
+                self._pick_bg_color(pos)
             return
 
         if not self._drawing or self._image is None:
@@ -377,6 +683,41 @@ class PixelCanvas(QWidget):
             self.update()
             return
 
+        if self._select_move:
+            # 拖动选区内容：快照恢复原图后，把内容（含清除源区）画到新选区位置
+            d = QPoint(pos.x() - self._move_start.x(), pos.y() - self._move_start.y())
+            new_tl = QPoint(self._move_anchor.x() + d.x(), self._move_anchor.y() + d.y())
+            self._selection = QRect(
+                new_tl.x(), new_tl.y(),
+                self._move_src.width(), self._move_src.height(),
+            )
+            img = self._move_snap.copy()
+            h, w = img.shape[:2]
+            s_ = self._move_src
+            sy0 = max(0, s_.y()); sx0 = max(0, s_.x())
+            sy1 = min(h, s_.y() + s_.height()); sx1 = min(w, s_.x() + s_.width())
+            if sy1 > sy0 and sx1 > sx0:
+                data = img[sy0:sy1, sx0:sx1].copy()
+                img[sy0:sy1, sx0:sx1] = [0, 0, 0, 0]  # 清除源位置
+                d_ = self._selection
+                dy0 = max(0, d_.y()); dx0 = max(0, d_.x())
+                dy1 = min(h, d_.y() + d_.height()); dx1 = min(w, d_.x() + d_.width())
+                if dy1 > dy0 and dx1 > dx0:
+                    img[dy0:dy1, dx0:dx1] = data[:dy1 - dy0, :dx1 - dx0]
+            self._image = img
+            self._qimage = None
+            self.update()
+            return
+
+        if self._selecting:
+            # 框选拖动：实时更新选区矩形（整包含起点与当前点）
+            sp = self._selection_start
+            x0, x1 = min(sp.x(), pos.x()), max(sp.x(), pos.x())
+            y0, y1 = min(sp.y(), pos.y()), max(sp.y(), pos.y())
+            self._selection = QRect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+            self.update()
+            return
+
         if self._tool in (self.TOOL_BRUSH, self.TOOL_ERASER):
             color = self._fg_color if self._tool == self.TOOL_BRUSH else QColor(0, 0, 0, 0)
             # 对相邻鼠标事件间插值（8 连通 Bresenham），避免快速拖动断线
@@ -393,14 +734,24 @@ class PixelCanvas(QWidget):
                     self._draw_pixel(p.x(), p.y(), color)
             self._pp_last_raw = QPoint(pos)
             self.pixel_edited.emit()
-        elif self._tool in (self.TOOL_LINE, self.TOOL_RECT) and self._temp_preview is not None:
+        elif self._tool in (self.TOOL_LINE, self.TOOL_RECT, self.TOOL_CIRCLE) and self._temp_preview is not None:
             # 恢复原图，绘制预览
             self._image = self._temp_preview.copy()
             start = self._drag_start
             if self._tool == self.TOOL_LINE:
                 self._draw_line_bresenham(start.x(), start.y(), pos.x(), pos.y(), self._fg_color, self._image)
-            else:
+            elif self._tool == self.TOOL_RECT:
                 self._draw_rect(start.x(), start.y(), pos.x(), pos.y(), self._fg_color, self._image)
+            else:
+                # 圆形：按住 Shift 时强制宽高相等（正圆）
+                p2 = pos
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    m = max(abs(pos.x() - start.x()), abs(pos.y() - start.y()))
+                    p2 = QPoint(
+                        start.x() + (1 if pos.x() >= start.x() else -1) * m,
+                        start.y() + (1 if pos.y() >= start.y() else -1) * m,
+                    )
+                self._draw_circle_midpoint(start.x(), start.y(), p2.x(), p2.y(), self._fg_color, self._image)
         self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
@@ -413,6 +764,21 @@ class PixelCanvas(QWidget):
             self._drawing = False
             self._temp_preview = None
             return
+        if self._right_picking:
+            # 右键取背景结束：复位标志
+            self._right_picking = False
+            self._drawing = False
+            return
+        if self._select_move:
+            # 选区拖动结束：提交最终图像与选区位置（作为一笔可撤销）
+            self._select_move = False
+            self._drawing = False
+            self._move_snap = None
+            self._move_src = None
+            self.pixel_edited.emit()
+            self.stroke_started.emit()
+            self.update()
+            return
         if self._shift_line:
             # Shift 临时直线结束：提交当前预览（松开左键提交）
             self._shift_line = False
@@ -421,9 +787,18 @@ class PixelCanvas(QWidget):
             self.pixel_edited.emit()
             self.stroke_started.emit()  # 操作完成后再压栈（记录操作后状态）
             return
+        if self._selecting:
+            # 框选结束：提交选区（不改图，不入撤销栈）
+            self._selecting = False
+            self._drawing = False
+            # 单击（1×1）视为清除/回选
+            if self._selection is not None and self._selection.width() <= 1 and self._selection.height() <= 1:
+                self._selection = None
+            self.update()
+            return
         if self._drawing:
             self._drawing = False
-            if self._tool in (self.TOOL_LINE, self.TOOL_RECT):
+            if self._tool in (self.TOOL_LINE, self.TOOL_RECT, self.TOOL_CIRCLE):
                 self._temp_preview = None
                 self.pixel_edited.emit()
             elif self._tool in (self.TOOL_BRUSH, self.TOOL_ERASER):
@@ -451,22 +826,26 @@ class PixelCanvas(QWidget):
             return
 
         h, w = self._image.shape[:2]
-        s = self._scale
+        s = int(round(self._scale))
 
-        # 绘制棋盘格背景（透明区域）
-        for y in range(h):
-            for x in range(w):
-                if self._image[y, x][3] == 0:  # 透明
-                    color = QColor("#2a2a2a") if (x + y) % 2 == 0 else QColor("#333333")
-                    p.fillRect(QRect(self._offset.x() + x * s, self._offset.y() + y * s, s, s), color)
+        # 棋盘格背景铺满画布（透明区域经 drawImage 露底）
+        p.drawTiledPixmap(self.rect(), self._checker)
 
-        # 绘制像素
-        qimg = QImage(self._image.tobytes(), w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
+        # 绘制像素（QImage 缓存：仅在内容变化时重建）
+        if (
+            self._qimage is None
+            or self._qimage.width() != w
+            or self._qimage.height() != h
+        ):
+            self._qimage = QImage(
+                self._image.tobytes(), w, h, w * 4,
+                QImage.Format.Format_RGBA8888,
+            ).copy()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        p.drawImage(QRect(self._offset.x(), self._offset.y(), w * s, h * s), qimg)
+        p.drawImage(QRect(self._offset.x(), self._offset.y(), w * s, h * s), self._qimage)
 
         # 像素网格
-        if s >= 8:
+        if self._grid_visible and s >= 8:
             p.setPen(QPen(QColor(128, 128, 128, 60), 1))
             for x in range(w + 1):
                 p.drawLine(self._offset.x() + x * s, self._offset.y(),
@@ -475,39 +854,121 @@ class PixelCanvas(QWidget):
                 p.drawLine(self._offset.x(), self._offset.y() + y * s,
                           self._offset.x() + w * s, self._offset.y() + y * s)
 
-        # 光标指示：隐藏系统光标，绘制前景色像素块 + 纯十字（无箭头）
-        if self._hover_pixel is not None and not self._panning:
-            hx, hy = self._hover_pixel.x(), self._hover_pixel.y()
-            cx = self._offset.x() + hx * s + s // 2
-            cy = self._offset.y() + hy * s + s // 2
+        # 对称轴参考线（绘制在网格之后、光标之前）
+        if self._symmetry != "none":
+            if self._symmetry in ("horizontal", "both"):
+                # 左右镜像（关于垂直中线）：画竖直虚线（蓝）
+                xp = self._offset.x() + (w * s) // 2
+                p.setPen(QPen(QColor(80, 160, 255, 210), 1, Qt.PenStyle.DashLine))
+                p.drawLine(xp, self._offset.y(), xp, self._offset.y() + h * s)
+            if self._symmetry in ("vertical", "both"):
+                # 上下镜像（关于水平中线）：画水平虚线（红）
+                yp = self._offset.y() + (h * s) // 2
+                p.setPen(QPen(QColor(255, 120, 120, 210), 1, Qt.PenStyle.DashLine))
+                p.drawLine(self._offset.x(), yp, self._offset.x() + w * s, yp)
 
-            # 光标下的像素色块：画笔时用前景色原样填充（不透明、无边框），
-            # 所见即所得——与左键按下绘制的颜色完全一致
+        # 框选选区：双色虚线矩形（蚂蚁线，白+黑叠画保证任何底色可见）
+        if self._selection is not None:
+            r = self._selection
+            rr = QRect(
+                self._offset.x() + r.x() * s,
+                self._offset.y() + r.y() * s,
+                r.width() * s,
+                r.height() * s,
+            )
+            p.setPen(QPen(QColor(255, 255, 255, 210), 1, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(rr)
+            p.setPen(QPen(QColor(0, 0, 0, 170), 1, Qt.PenStyle.DashLine))
+            p.drawRect(rr)
+
+        # 光标指示：隐藏系统光标。笔刷像素块对齐像素格子（白边标示落格范围），
+        # 十字准星完全跟随鼠标浮点位置（不对齐格子）
+        if self._cursor_pos is not None and not self._panning:
+            cxp = self._cursor_pos.x()
+            cyp = self._cursor_pos.y()
+            # 笔刷像素块：用与 mousePress 落子完全一致的像素映射（_hover_pixel，
+            # 整除向下取整），保证预览格 == 实际落子格，绝不偏移
+            if self._hover_pixel is not None:
+                gx = self._hover_pixel.x()
+                gy = self._hover_pixel.y()
+            else:
+                gx = int(cxp)
+                gy = int(cyp)
+            half = self._brush_size // 2
+            bx = self._offset.x() + (gx - half) * s
+            by = self._offset.y() + (gy - half) * s
+            bw = self._brush_size * s
+            bh = self._brush_size * s
             if self._tool == self.TOOL_BRUSH:
-                half = self._brush_size // 2
-                bx = self._offset.x() + (hx - half) * s
-                by = self._offset.y() + (hy - half) * s
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor(self._fg_color))
-                p.drawRect(bx, by, self._brush_size * s, self._brush_size * s)
+                p.drawRect(bx, by, bw, bh)
+                # 白色细边框圈出笔刷影响范围（对齐格线，帮助看清落格）
+                p.setPen(QPen(QColor(255, 255, 255, 235), 1))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(bx, by, bw, bh)
 
-            # 纯十字：黑色外描边（粗 3px）保证任何底色下可见，白色 1px 十字线
+            # 纯十字准星：完全跟随鼠标（像素中心 = 鼠标像素位置，不额外偏移）
+            cx = self._offset.x() + cxp * s
+            cy = self._offset.y() + cyp * s
             arm = 14
             p.setPen(QPen(QColor(0, 0, 0, 200), 3))
-            p.drawLine(cx - arm, cy, cx + arm, cy)
-            p.drawLine(cx, cy - arm, cx, cy + arm)
+            p.drawLine(QPointF(cx - arm, cy), QPointF(cx + arm, cy))
+            p.drawLine(QPointF(cx, cy - arm), QPointF(cx, cy + arm))
             p.setPen(QPen(QColor(255, 255, 255, 235), 1))
-            p.drawLine(cx - arm, cy, cx + arm, cy)
-            p.drawLine(cx, cy - arm, cx, cy + arm)
+            p.drawLine(QPointF(cx - arm, cy), QPointF(cx + arm, cy))
+            p.drawLine(QPointF(cx, cy - arm), QPointF(cx, cy + arm))
 
     def wheelEvent(self, event) -> None:
-        """滚轮缩放。"""
-        delta = event.angleDelta().y()
-        if delta > 0:
-            self._scale = min(64, self._scale + 2)
-        else:
-            self._scale = max(1, self._scale - 2)
+        """滚轮以鼠标位置为锚点居中缩放（系数 1.15，范围 1-64，内部 float）。"""
+        if self._image is None:
+            return
+        delta = event.angleDelta().y() / 120.0
+        factor = 1.15 if delta > 0 else 1 / 1.15
+        new_scale = max(1.0, min(64.0, self._scale * factor))
+        mouse_pos = event.position().toPoint()
+        # 保持鼠标位置下的图像像素在原处：缩放前记录图像坐标，缩放后反算 offset
+        prev_scale = self._scale
+        img_x = (mouse_pos.x() - self._offset.x()) / prev_scale
+        img_y = (mouse_pos.y() - self._offset.y()) / prev_scale
+        self._scale = new_scale
+        self._offset = QPoint(
+            int(mouse_pos.x() - img_x * new_scale),
+            int(mouse_pos.y() - img_y * new_scale),
+        )
         self.update()
+
+    def fit_to_view(self) -> None:
+        """等比缩放图像以完整显示在画布内并居中。"""
+        if self._image is None:
+            return
+        h, w = self._image.shape[:2]
+        cw, ch = self.width(), self.height()
+        if w <= 0 or h <= 0 or cw <= 0 or ch <= 0:
+            return
+        scale = min(cw / w, ch / h)
+        scale = max(1.0, min(64.0, scale))
+        self._scale = scale
+        self._offset = QPoint(int((cw - w * scale) / 2), int((ch - h * scale) / 2))
+        self.update()
+
+    def reset_view(self) -> None:
+        """重置视图：适中缩放（视口/图像向下取整并钳制）并居中。"""
+        if self._image is None:
+            return
+        h, w = self._image.shape[:2]
+        cw, ch = self.width(), self.height()
+        if w <= 0 or h <= 0 or cw <= 0 or ch <= 0:
+            return
+        scale = max(1, min(64, int(cw / w), int(ch / h)))
+        self._scale = float(scale)
+        self._offset = QPoint(int((cw - w * scale) / 2), int((ch - h * scale) / 2))
+        self.update()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        """双击适配视图。"""
+        self.fit_to_view()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Space:
@@ -525,10 +986,19 @@ class PixelCanvas(QWidget):
             self._temp_preview = None
 
     def leaveEvent(self, event) -> None:
-        # 鼠标离开画布：清除笔刷范围框
+        # 鼠标离开画布：清除光标与笔刷范围框并复位状态栏
         self._hover_pixel = None
+        self._cursor_pos = None
+        self.cursor_moved.emit()
         self.update()
         super().leaveEvent(event)
+
+    def get_hover_info(self) -> str:
+        """返回状态栏悬停信息字符串；无图像/未悬停时返回"就绪"。"""
+        if self._image is None or self._hover_pixel is None:
+            return "就绪"
+        x, y = self._hover_pixel.x(), self._hover_pixel.y()
+        return f"{x}, {y} | {self._fg_color.name()} | {self._cell_size()}%"
 
 
 class PixelEditor(QMainWindow):
@@ -577,6 +1047,7 @@ class PixelEditor(QMainWindow):
         self.canvas.pixel_edited.connect(self._on_pixel_edited)
         # 每次绘制笔画开始时压入撤销栈（Ctrl+Z 可逐笔撤销）
         self.canvas.stroke_started.connect(self._push_undo)
+        self.canvas.cursor_moved.connect(self._on_cursor_moved)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.canvas)
@@ -613,6 +1084,8 @@ class PixelEditor(QMainWindow):
             (PixelCanvas.TOOL_FILL, "油漆桶 (G)", "油漆桶"),
             (PixelCanvas.TOOL_LINE, "直线 (L)", "直线"),
             (PixelCanvas.TOOL_RECT, "矩形 (U)", "矩形"),
+            (PixelCanvas.TOOL_CIRCLE, "圆形 (C)", "圆形"),
+            (PixelCanvas.TOOL_SELECT, "框选 (M)", "框选"),
         ]
 
         for tool_id, tooltip, label in tools:
@@ -656,6 +1129,11 @@ class PixelEditor(QMainWindow):
         self.bg_color_btn.clicked.connect(self._pick_bg_color)
         layout.addWidget(self.bg_color_btn)
 
+        # 交换前景/背景色（X）
+        self.swap_btn = QPushButton("交换前/背景 (X)")
+        self.swap_btn.clicked.connect(lambda: self.canvas.swap_colors())
+        layout.addWidget(self.swap_btn)
+
         # 笔刷大小
         layout.addWidget(QLabel("笔刷大小:"))
         self.brush_spin = QSpinBox()
@@ -663,6 +1141,87 @@ class PixelEditor(QMainWindow):
         self.brush_spin.setValue(1)
         self.brush_spin.valueChanged.connect(lambda v: self.canvas.set_brush_size(v))
         layout.addWidget(self.brush_spin)
+
+        # 笔刷形状（圆形/方形）
+        layout.addWidget(QLabel("笔刷形状:"))
+        self._shape_btns = QButtonGroup(self)
+        self._shape_btns.setExclusive(True)
+        shape_row = QHBoxLayout()
+        for shape, label in (("circle", "圆形"), ("square", "方形")):
+            btn = QToolButton()
+            btn.setText(label)
+            btn.setCheckable(True)
+            btn.setFixedSize(64, 28)
+            btn.setStyleSheet(
+                "QToolButton { background: #333; color: #e0e0e0; border: none; "
+                "border-radius: 4px; font-size: 12px; }"
+                "QToolButton:hover { background: #444; }"
+                "QToolButton:checked { background: #3d5a80; }"
+            )
+            btn.clicked.connect(lambda checked, sh=shape: self.canvas.set_brush_shape(sh))
+            self._shape_btns.addButton(btn)
+            if shape == self.canvas.get_brush_shape():
+                btn.setChecked(True)
+            shape_row.addWidget(btn)
+        layout.addLayout(shape_row)
+
+        # 像素网格显示开关
+        self.grid_visible_chk = QCheckBox("显示网格")
+        self.grid_visible_chk.setChecked(True)
+        self.grid_visible_chk.toggled.connect(self.canvas.set_grid_visible)
+        layout.addWidget(self.grid_visible_chk)
+
+        # 对称模式（Shift+S 循环切换）
+        layout.addWidget(QLabel("对称 (Shift+S):"))
+        self.symmetry_combo = QComboBox()
+        self.symmetry_combo.addItems(["无", "左右镜像", "上下镜像", "四象限"])
+        self.symmetry_combo.currentIndexChanged.connect(
+            lambda i: self.canvas.set_symmetry(
+                ["none", "horizontal", "vertical", "both"][i]
+            )
+        )
+        layout.addWidget(self.symmetry_combo)
+
+        # 选区操作：剪切/复制/粘贴 + 水平/垂直翻转（M 框选后用）
+        layout.addWidget(QLabel("选区操作:"))
+        _sel_btns = (
+            ("剪切", "Ctrl+X", lambda: self.canvas.cut_selection()),
+            ("复制", "Ctrl+C", lambda: self.canvas.copy_selection()),
+            ("粘贴", "Ctrl+V", lambda: self.canvas.paste_clipboard()),
+        )
+        _sel_row1 = QHBoxLayout()
+        _sel_row1.setSpacing(4)
+        for text, shortcut, handler in _sel_btns:
+            btn = QToolButton()
+            btn.setText(f"{text}\n({shortcut})")
+            btn.setToolTip(f"{text}（快捷键 {shortcut}）")
+            btn.setFixedSize(56, 44)
+            btn.setStyleSheet(
+                "QToolButton { background: #333; color: #e0e0e0; border: none; "
+                "border-radius: 4px; font-size: 11px; }"
+                "QToolButton:hover { background: #444; }"
+            )
+            btn.clicked.connect(lambda checked, h=handler: h())
+            _sel_row1.addWidget(btn)
+        layout.addLayout(_sel_row1)
+        _sel_row2 = QHBoxLayout()
+        _sel_row2.setSpacing(4)
+        for text, shortcut, handler in (
+            ("水平翻转", "H", lambda: self.canvas.flip_selection_horizontal()),
+            ("垂直翻转", "V", lambda: self.canvas.flip_selection_vertical()),
+        ):
+            btn = QToolButton()
+            btn.setText(f"{text}\n({shortcut})")
+            btn.setToolTip(f"{text}（快捷键 {shortcut}）")
+            btn.setFixedSize(86, 44)
+            btn.setStyleSheet(
+                "QToolButton { background: #333; color: #e0e0e0; border: none; "
+                "border-radius: 4px; font-size: 11px; }"
+                "QToolButton:hover { background: #444; }"
+            )
+            btn.clicked.connect(lambda checked, h=handler: h())
+            _sel_row2.addWidget(btn)
+        layout.addLayout(_sel_row2)
 
         # 完美像素（Aseprite 风格，默认开启）：自动消除对角双像素伪影
         self.perfect_pixel_chk = QCheckBox("完美像素")
@@ -714,6 +1273,9 @@ class PixelEditor(QMainWindow):
             "G": lambda: self._select_tool(PixelCanvas.TOOL_FILL),
             "L": lambda: self._select_tool(PixelCanvas.TOOL_LINE),
             "U": lambda: self._select_tool(PixelCanvas.TOOL_RECT),
+            "C": lambda: self._select_tool(PixelCanvas.TOOL_CIRCLE),
+            "M": lambda: self._select_tool(PixelCanvas.TOOL_SELECT),
+            "X": lambda: self.canvas.swap_colors(),  # 交换前/背景色
         }
         for key, handler in shortcuts.items():
             action = QAction(self)
@@ -744,6 +1306,44 @@ class PixelEditor(QMainWindow):
         save_action.triggered.connect(self._on_save)
         self.addAction(save_action)
 
+        # Ctrl+0 重置视图（居中适中缩放）
+        reset_action = QAction(self)
+        reset_action.setShortcut(QKeySequence("Ctrl+0"))
+        reset_action.triggered.connect(self.canvas.reset_view)
+        self.addAction(reset_action)
+
+        # 选区操作：Ctrl+X 剪切、Ctrl+C 复制、Ctrl+V 粘贴、H 水平翻转、V 垂直翻转
+        cut_action = QAction(self)
+        cut_action.setShortcut(QKeySequence("Ctrl+X"))
+        cut_action.triggered.connect(self.canvas.cut_selection)
+        self.addAction(cut_action)
+
+        copy_action = QAction(self)
+        copy_action.setShortcut(QKeySequence("Ctrl+C"))
+        copy_action.triggered.connect(self.canvas.copy_selection)
+        self.addAction(copy_action)
+
+        paste_action = QAction(self)
+        paste_action.setShortcut(QKeySequence("Ctrl+V"))
+        paste_action.triggered.connect(self.canvas.paste_clipboard)
+        self.addAction(paste_action)
+
+        flip_h = QAction(self)
+        flip_h.setShortcut(QKeySequence("H"))
+        flip_h.triggered.connect(self.canvas.flip_selection_horizontal)
+        self.addAction(flip_h)
+
+        flip_v = QAction(self)
+        flip_v.setShortcut(QKeySequence("V"))
+        flip_v.triggered.connect(self.canvas.flip_selection_vertical)
+        self.addAction(flip_v)
+
+        # Shift+S 循环切换对称模式
+        sym_action = QAction(self)
+        sym_action.setShortcut(QKeySequence("Shift+S"))
+        sym_action.triggered.connect(self.canvas.cycle_symmetry)
+        self.addAction(sym_action)
+
         # [ ] 笔刷大小
         brush_down = QAction(self)
         brush_down.setShortcut(QKeySequence("["))
@@ -772,6 +1372,8 @@ class PixelEditor(QMainWindow):
             PixelCanvas.TOOL_FILL: 3,
             PixelCanvas.TOOL_LINE: 4,
             PixelCanvas.TOOL_RECT: 5,
+            PixelCanvas.TOOL_CIRCLE: 6,
+            PixelCanvas.TOOL_SELECT: 7,
         }.get(tool, 0)
         btns = self._tool_buttons.buttons()
         if 0 <= idx < len(btns):
@@ -834,6 +1436,14 @@ class PixelEditor(QMainWindow):
         """画布编辑时更新颜色按钮。"""
         self._update_color_buttons()
 
+    def _on_cursor_moved(self) -> None:
+        """光标在画布移动：刷新状态栏（含工具与像素信息）。"""
+        info = self.canvas.get_hover_info()
+        if info == "就绪":
+            self.status.showMessage("就绪")
+            return
+        self.status.showMessage(f"工具: {self.canvas.get_tool()} | {info}")
+
     def _push_undo(self) -> None:
         """压入撤销栈（记录操作完成后的状态；与上一状态相同则跳过）。"""
         img = self.canvas.get_image_rgba()
@@ -851,7 +1461,8 @@ class PixelEditor(QMainWindow):
         current = self._undo_stack.pop()
         self._redo_stack.append(current)
         prev = self._undo_stack[-1]
-        self.canvas.set_image(prev[:, :, :3])
+        # set_image 对 4 通道输入直接保留（含透明 alpha），透明像素可正确撤销
+        self.canvas.set_image(prev)
         self.status.showMessage("撤销")
 
     def _redo(self) -> None:
@@ -859,7 +1470,7 @@ class PixelEditor(QMainWindow):
             return
         img = self._redo_stack.pop()
         self._undo_stack.append(img)
-        self.canvas.set_image(img[:, :, :3])
+        self.canvas.set_image(img)
         self.status.showMessage("重做")
 
     def _on_save(self) -> None:

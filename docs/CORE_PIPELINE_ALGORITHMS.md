@@ -120,6 +120,7 @@ load → denoise_global → resize → grid_detect → extract → palette_refin
 | `upscale_factor` | 2 | 放大倍数 |
 | `min_p` / `max_p` | 3 / 40 | 网格候选周期搜索范围（像素） |
 | `snr_threshold` | 8.0 | FFT 网格判定 SNR 阈值 |
+| `detect_max_size` | 2048 | 检测输入图最大边长：放大后超限则检测回退原图并映射坐标（S2） |
 | `detect_signal` | "gray" | 检测信号模式："gray"/"oklab"（G1，等亮度异色块需 oklab） |
 | `enable_pre_quantize` | False | 检测前对检测信号做小调色板预量化（P2，默认关） |
 | `enable_peak_lattice_fit` | True | 峰值格点拟合周期精化（G3，非整数块尺寸如 7.5px） |
@@ -204,7 +205,10 @@ if conf_x > 0.3 or (e_vote_x > 1e-12 and e_fft_x > 1e-12 and e_vote_x > 1.2 * e_
 # 7. px/py 策略：
 #    单方向失败 → 统一为另一方向；
 #    相对差 < 0.15 → 按 SNR 加权平均；
-#    否则分开，且长宽比差异 > 0.3 时回退为边界强度更高方向的周期（正方块）
+#    否则分开，且长宽比差异 > AR_GUARD_RATIO_DIFF(0.12) 时先做两轴联合
+#    周期再搜索（_ar_joint_research，见 3.12），无优解再回退为边界强度
+#    更高方向的周期（正方块）——防止非整数周期两轴锁不同错误周期导致的
+#    拉伸畸变（真实案例：9.5px 块两轴锁 10/8，输出 AR 畸变 20%）
 
 # 8. 高分辨率合理性门控（Task 5，见 3.11）：确定最佳周期后、find_phase 前
 #    周期 < PLAUSIBILITY_MIN_PERIOD(3px) 时链式检查整数倍 k*p：
@@ -754,6 +758,31 @@ phase+等距模型，或逐交点坐标等距）且 `method` 为 `median`/`mean`
 大图提速一个数量级；不均匀网格、`mode`/`kmeans`/`dominant` 方法或边界
 退化时自动回退逐块路径（结果不变）。
 
+**S1：长宽比守恒防护与两轴联合周期再搜索**
+
+非整数块周期（如真实 9.5px）下两轴投票可能分别锁到不同的错误整数周期
+（真实案例：两轴锁 10/8 → 输出 AR 畸变 20%，即转换"拉伸"）。防护链：
+分开使用两轴周期后，若逻辑分辨率长宽比与原图相对差 >
+`AR_GUARD_RATIO_DIFF`(0.12)，先做联合再搜索（`_ar_joint_research`）：
+候选池含两轴投票值/FFT 主峰/ACF 峰/梳状 top-N 连续 pitch（`_comb_top_pitches`，
+非整数可入池）及其 ×2/×0.5 扩展，组合评分以 AR 守恒（相对差 <
+`AR_GUARD_ACCEPT_AR` 0.03）为主、两轴边界带强度（复用边缘积分图）为辅；
+最优组合边界强度 ≥ 原组合 0.8 倍（`AR_GUARD_EDGE_FLOOR`）时采纳，否则
+回退边界强度较高方向的正方形块保底。`detect()` 的 `aspect_guard_tol`
+参数可覆盖触发阈值。实测 slice_06.jpg 畸变 20.2% → 0.4%（71×64），
+其余 AR 守恒图零扰动。
+
+**S2：检测尺寸上限与坐标映射（`detect_max_size`，默认 2048）**
+
+大图放大路径的性能保护：`grid_detect` 输入图（resize 后）任一边超过
+`detect_max_size` 时，检测改在放大前（denoise 后）原图上执行，完成后
+`_map_grid_to_scale` 将 `px/py/phase_x/phase_y/cell_ys/cell_xs` 按缩放比
+线性映射回放大坐标系（nearest 放大下精确 ×f，插值放大亚像素误差 <1px），
+`w_logic/h_logic` 不变，extract 仍消费放大图与映射后网格。放大后 ≤上限
+（小图）保持放大图上检测，保留"非整数周期 ×f 后更接近整数"的精度收益。
+实测 image02.png（2048²）放大 2x：grid_detect 10.7s → 3.8s（检测在
+2048² 原图执行），全流程 12.3s → 6.9s（≤10s 预算）。
+
 ---
 
 ## 4 块提取 extract
@@ -1010,6 +1039,7 @@ gray = 0.299 * R + 0.587 * G + 0.114 * B
 | `smooth_strength` | 0.5 | 网格检测 | 全局正则化混合强度（0=纯观测，1=纯模型） |
 | `outlier_reject_ratio` | 0.5 | 网格检测 | 离群间距剔除阈值比例 |
 | `detect_signal` | "gray" | 网格检测 | 检测信号模式 gray/oklab（G1；oklab 供等亮度异色块，默认 gray） |
+| `detect_max_size` | 2048 | 网格检测 | 检测输入图最大边长：放大后超限则检测回退原图并映射坐标（S2） |
 | `enable_pre_quantize` | False | 网格检测 | 检测前对检测信号做小调色板预量化（P2，默认关） |
 | `enable_peak_lattice_fit` | True | 网格检测 | 峰值格点拟合周期精化（G3，含轴一致性防护，默认开） |
 | `enable_comb_energy_score` | True | 网格检测 | 梳状能量集中度周期终审（G2，低置信自动回退，默认开） |

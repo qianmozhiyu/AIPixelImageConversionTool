@@ -624,6 +624,15 @@ PLAUSIBILITY_MIN_PERIOD = 3   # 周期 < 该值才触发门控（1-2px 生成纹
 PLAUSIBILITY_EDGE_RATIO = 1.3 # 采纳更大倍周期需其边界带显著更强（>1.0 防均匀格点阵）
 PLAUSIBILITY_MAX_STEPS = 6    # 链式放大的最大步数（2→4→8→…）
 
+# --- S1：长宽比守恒防护常量（AR guard）---
+# 旧硬编码 0.3 过松：slice_06.jpg（683×618，真实块周期 ~9.5px 非整数）两轴
+# 投票分别锁到 (10, 8)，输出 67×76 长宽比畸变 20.2% 仍被放过（用户看到
+# 的"拉伸"）；正常图 round 取整误差引起的输出畸变 <5%，取 0.12 两者之间
+# 留安全裕量。触发后先做两轴联合周期再搜索，无优解才回退正方形。
+AR_GUARD_RATIO_DIFF = 0.12  # 触发长宽比守恒防护的输出/输入比例相对偏差阈值
+AR_GUARD_ACCEPT_AR = 0.03   # 联合再搜索组合可被采纳的最大输出长宽比相对偏差
+AR_GUARD_EDGE_FLOOR = 0.8   # 采纳组合的两轴边界强度之和相对原组合的下限比例
+
 # G3：峰值格点拟合周期精化常量
 PEAK_LATTICE_MIN_PEAKS = 4    # 参与拟合的最少峰数（不足直接回退投票值）
 PEAK_LATTICE_MAX_FITS = 20    # k 扫描的 minimize 调用数上限（防大图过慢）
@@ -1244,6 +1253,81 @@ def _comb_best_period(
         separation = min(max(separation, 0.0), 1.0)
     conf = quality * separation
     return (float(best_pitch), float(best_phase), float(conf))
+
+
+def _comb_top_pitches(
+    profile: np.ndarray, min_p: int, max_p: int, top_n: int = 5
+) -> list[float]:
+    """梳状连续搜索的 top-N 周期候选（S1 联合再搜索候选池来源）。
+
+    复用 ``_comb_best_period`` 的分段粗扫骨架（σ=0.5 平滑 + ~2% 相对
+    步长 + 分段最优相位打分），按粗扫分数降序贪心取前 ``top_n`` 个不同
+    峰（8% 去重窗口），每个峰再做一次细网格精化（``_comb_fine_grid_search``，
+    向量化）得到非整数 pitch——真实非整数块周期（如 slice_06 的 ~9.49px）
+    只能从连续搜索产出，整数化的投票/ACF/FFT-bin 候选无法覆盖。精化分数
+    远低于自身粗扫分数（< COMB_REFINE_CONSISTENCY，分段平台噪声）时
+    回退该粗扫平台值，保证候选仍可用。
+
+    Args:
+        profile: 1D 投影信号（sig_x / sig_y）。
+        min_p: 周期下界（≥1）。
+        max_p: 周期上界。
+        top_n: 返回候选数上限。
+
+    Returns:
+        ``[pitch, ...]``（按粗扫分数降序，浮点非整数）。profile 过短
+        （< 4×min_p）、参数非法或总能量 ≈ 0 时返回空列表。
+    """
+    prof = np.asarray(profile, dtype=np.float64)
+    if min_p < 1 or max_p < min_p or top_n < 1:
+        return []
+    n = int(prof.size)
+    if n < COMB_MIN_PROFILE_MULT * int(min_p) or n < 8:
+        return []
+    from scipy.ndimage import gaussian_filter1d
+
+    prof_s = gaussian_filter1d(prof, sigma=0.5, mode="nearest")
+    total = float(prof_s.sum())
+    if total <= 1e-12:
+        return []
+    # 粗扫：与 _comb_best_period 相同的 ~2% 相对步长 pitch 序列 + 分段
+    # 最优相位打分（对 2% 网格落点漂移免疫，真周期排名稳定）
+    pitches: list[float] = []
+    p = float(min_p)
+    while p <= float(max_p) + 1e-9:
+        pitches.append(p)
+        p *= 1.0 + COMB_COARSE_REL_STEP
+    if not pitches:
+        return []
+    coarse_score = np.array(
+        [_comb_seg_coarse_score(prof_s, total, pi) for pi in pitches],
+        dtype=np.float64,
+    )
+    # 贪心 top-N 不同峰（去重窗口同 _comb_best_period：≥ 分段平台宽 ±4%）
+    order = np.argsort(-coarse_score, kind="stable")
+    picked: list[int] = []
+    for idx in order:
+        idx = int(idx)
+        pi = pitches[idx]
+        if any(
+            abs(pi - pitches[q]) / max(pi, pitches[q]) < COMB_TOPK_EXCL_REL
+            for q in picked
+        ):
+            continue
+        picked.append(idx)
+        if len(picked) >= top_n:
+            break
+    # 每峰一次细网格精化（向量化、单次 ~ms 级），把平台值收敛到精确 pitch
+    out: list[float] = []
+    for idx in picked:
+        p_ref, _ph, s_ref = _comb_fine_grid_search(
+            prof_s, total, pitches[idx], float(min_p), float(max_p)
+        )
+        if p_ref > 0 and s_ref >= COMB_REFINE_CONSISTENCY * float(coarse_score[idx]):
+            out.append(float(p_ref))
+        else:
+            out.append(float(pitches[idx]))
+    return out
 
 
 def detect_jpeg_grid(
@@ -1910,6 +1994,191 @@ def find_phase_edge(
     return (best_phase_x, best_phase_y, float(conf))
 
 
+def _ar_joint_pick(
+    cands_x: Sequence[float],
+    cands_y: Sequence[float],
+    W: int,
+    H: int,
+    edge_map: np.ndarray,
+    edge_integral: np.ndarray | None,
+    cur_px: float,
+    cur_py: float,
+) -> tuple[float, float] | None:
+    """两轴周期组合的联合评分与采纳（S1 核心可测逻辑）。
+
+    对 cands_x × cands_y 组合评分（先预计算每轴候选的逻辑块数与边界带
+    强度，组合查表单次 O(1)）：
+
+    - ``w_est = round(W/px)``、``h_est = round(H/py)``（与 _count_blocks
+      的 round 容差一致，简化为纯 round）；
+    - ``ar_diff = |w_est/h_est − W/H| / (W/H)``，仅 ``ar_diff <
+      AR_GUARD_ACCEPT_AR`` 的组合可被采纳；
+    - 主排序 ar_diff 升序（量化到 0.005 档，同档视为等价 AR），同档按
+      两轴边界强度之和 ``e_x + e_y`` 降序（同档 AR 下优先边界证据强
+      的组合，防 AR 巧合对齐但周期错误的候选胜出）；
+    - 接受准则：最优组合的 ``e_x* + e_y*`` ≥ ``AR_GUARD_EDGE_FLOOR`` ×
+      原组合（cur_px, cur_py）的边界强度之和，否则返回 None。
+
+    Args:
+        cands_x / cands_y: 两轴候选周期池（已过滤到合法范围）。
+        W / H: 图像宽高（像素）。
+        edge_map: 边缘强度图 (H, W)。
+        edge_integral: ``edge_map`` 的预构建积分图（None 时内部构建）。
+        cur_px / cur_py: 触发防护的当前（分开使用）周期，作为边界强度基准。
+
+    Returns:
+        采纳的 (px, py)，允许 px≠py（非正方形真实块组合如 (9.49, 9.51)）；
+        无 AR 达标组合或边界强度不达标时返回 None。
+    """
+    ratio_orig = W / H
+    # 每轴候选预计算：(周期, 逻辑块数, 边界带强度)。组合循环查表，避免
+    # 同一候选在 ~400 个组合里重复做积分图条带求和（Python 循环热点）
+    info_x: list[tuple[float, int, float]] = []
+    for px in cands_x:
+        px = float(px)
+        if px <= 0:
+            continue
+        info_x.append(
+            (px, int(round(W / px)),
+             _edge_band_strength(edge_map, px, axis=1, integral=edge_integral))
+        )
+    info_y: list[tuple[float, int, float]] = []
+    for py in cands_y:
+        py = float(py)
+        if py <= 0:
+            continue
+        info_y.append(
+            (py, int(round(H / py)),
+             _edge_band_strength(edge_map, py, axis=0, integral=edge_integral))
+        )
+    if not info_x or not info_y:
+        return None
+    # 原组合边界强度之和（接受准则的基准）
+    e_cur = (
+        _edge_band_strength(edge_map, float(cur_px), axis=1, integral=edge_integral)
+        + _edge_band_strength(edge_map, float(cur_py), axis=0, integral=edge_integral)
+    )
+    best: tuple[tuple[int, float], float, float, float] | None = None
+    for px, w_est, e_x in info_x:
+        if w_est < 1:
+            continue
+        for py, h_est, e_y in info_y:
+            if h_est < 1:
+                continue
+            ar_diff = abs(w_est / h_est - ratio_orig) / ratio_orig
+            if ar_diff >= AR_GUARD_ACCEPT_AR:
+                continue
+            # 同 ar 档（0.005 量化）按边界强度之和降序
+            key = (round(ar_diff / 0.005), -(e_x + e_y))
+            if best is None or key < best[0]:
+                best = (key, px, py, e_x + e_y)
+    if best is None:
+        return None
+    if best[3] >= AR_GUARD_EDGE_FLOOR * e_cur:
+        return (best[1], best[2])
+    return None
+
+
+def _ar_joint_research(
+    sig_x: np.ndarray,
+    sig_y: np.ndarray,
+    W: int,
+    H: int,
+    cur_px: float,
+    cur_py: float,
+    edge_map: np.ndarray,
+    min_p: int,
+    max_p: int,
+    edge_integral: np.ndarray | None = None,
+    vote_px: float = 0.0,
+    vote_py: float = 0.0,
+) -> tuple[float, float] | None:
+    """长宽比失配时的两轴联合周期再搜索（S1 回退链第二级）。
+
+    单轴投票在非整数块周期（如 ~9.5px）下两轴可分别锁到不同错误整数
+    （slice_06：x=10/y=8，输出 67×76 长宽比畸变 20.2%）。本函数收集
+    两轴各自的多源候选池：
+
+    - 该轴投票值（vote_px/vote_py 原始值，detect 作用域可能已被
+      runs/G3/G2 覆盖到 period_x/period_y）与当前值；
+    - FFT 主峰周期（抛物线插值，非整数）；
+    - ACF 峰前 5 个（整数 lag）；
+    - 梳状连续搜索 top-5（``_comb_top_pitches``，非整数——真实 9.49
+      这类值只能来自连续搜索）；
+    - 每个候选扩展 ×2 与 ×0.5（谐波家族换算，如 9.49→18.98/4.75），
+      全部过滤到 [max(min_p, 3), max_p]。
+
+    对 cands_x × cands_y 组合（去重后 ~20×20）做长宽比守恒 + 边界强度
+    联合评分（``_ar_joint_pick``），返回最优组合；无达标组合返回 None
+    （调用方回退现有正方形逻辑）。
+
+    Args:
+        sig_x / sig_y: 两轴 1D 投影信号（detect 作用域已算好）。
+        W / H: 图像宽高（像素）。
+        cur_px / cur_py: 触发防护的当前（分开使用）周期。
+        edge_map: 边缘强度图 (H, W)。
+        min_p / max_p: 候选周期范围。
+        edge_integral: ``edge_map`` 的预构建积分图（None 时内部构建）。
+        vote_px / vote_py: 两轴投票原始值（增强候选池覆盖）。
+
+    Returns:
+        采纳的 (px, py) 或 None（无优解）。
+    """
+    lo = float(max(min_p, 3))
+    hi = float(max_p)
+
+    def _axis_raw(sig: np.ndarray, cur_p: float, vote_p: float) -> set[float]:
+        """收集单轴直接源候选：当前/投票值、FFT 主峰、ACF 前 5 峰、梳状 top-5。"""
+        raw: set[float] = set()
+        for v in (float(cur_p), float(vote_p)):
+            if v > 0:
+                raw.add(v)
+        _snr_fft, p_fft = _fft_band_snr(sig, min_p, max_p)
+        if p_fft > 0:
+            raw.add(float(p_fft))
+        peaks, _acf = _acf_period(sig, min_p, max_p)
+        for pk in peaks[:5]:
+            raw.add(float(pk))
+        for cp in _comb_top_pitches(sig, min_p, max_p, top_n=5):
+            if cp > 0:
+                raw.add(float(cp))
+        return raw
+
+    def _expand(raw: set[float]) -> list[float]:
+        """扩展 ×2/×0.5 谐波换算（如 9.49→18.98/4.75）并过滤到 [lo, hi]。"""
+        out: set[float] = set()
+        for c in raw:
+            for v in (c, 2.0 * c, 0.5 * c):
+                if lo <= v <= hi:
+                    out.add(round(v, 4))
+        return sorted(out)
+
+    raw_x = _axis_raw(sig_x, cur_px, vote_px)
+    raw_y = _axis_raw(sig_y, cur_py, vote_py)
+    # 正方形网格先验的对称交叉注入：对侧轴候选与本轴某候选同族（相对差
+    # < COMB_FAMILY_REL，即同一周期的两轴表述）时注入本轴参与评分。单轴
+    # 检测器在非整数周期下可整体偏移（slice_06 x 轴 comb/fft 一致锁
+    # 9.93 而真值 ~9.49，y 轴 comb 锁 9.461），对侧同族候选注入后仍需
+    # 通过本轴边界带强度的图像域评分验证，不引入无证据的周期假设。
+    # 两侧配对都基于注入前的原始集合（防连锁注入），且只取相对差分支。
+    orig_x, orig_y = set(raw_x), set(raw_y)
+    raw_x |= {
+        b for b in orig_y
+        if any(abs(a - b) / max(a, b) < COMB_FAMILY_REL for a in orig_x)
+    }
+    raw_y |= {
+        a for a in orig_x
+        if any(abs(a - b) / max(a, b) < COMB_FAMILY_REL for b in orig_y)
+    }
+    cands_x = _expand(raw_x)
+    cands_y = _expand(raw_y)
+    if not cands_x or not cands_y:
+        return None
+    return _ar_joint_pick(
+        cands_x, cands_y, W, H, edge_map, edge_integral, cur_px, cur_py
+    )
+
+
 def detect(
     gray: np.ndarray, min_p: int = 3, max_p: int = 40, step: float = 0.1,
     snr_threshold: float = 8.0,
@@ -1925,6 +2194,7 @@ def detect(
     enable_peak_lattice_fit: bool = False,
     enable_comb_energy_score: bool = False,
     jpeg_grid_guard: bool = False,
+    aspect_guard_tol: float | None = None,
 ) -> Grid:
     """自动检测像素网格。
 
@@ -1976,6 +2246,13 @@ def detect(
             G2 梳状终审/G3 峰值拟合为图像域独立判据，不受惩罚影响；
             检测结果 ``(is_significant, phase, strength)`` 记录进
             ``Grid.jpeg_grid`` 供 A/B 分析。
+        aspect_guard_tol: 长宽比守恒防护阈值（S1）。两轴周期差异大而分开
+            使用（rel_diff ≥ 0.15）时，若推导出的逻辑分辨率长宽比相对
+            输入宽高比的偏差超过该阈值，先做两轴联合周期再搜索
+            （``_ar_joint_research``，候选池含梳状连续搜索的非整数
+            pitch，可找回 (9.49, 9.51) 这类真实非整数块组合），无优解
+            再回退正方形块。None 时用模块级 ``AR_GUARD_RATIO_DIFF``
+            （0.12；旧硬编码 0.3 过松，slice_06 的 20.2% 畸变被放过）。
 
     Returns:
         Grid: 检测结果。
@@ -2007,6 +2284,8 @@ def detect(
         sig_x = np.abs(np.diff(norm_gray, axis=1)).sum(axis=0)
         sig_y = np.abs(np.diff(norm_gray, axis=0)).sum(axis=1)
     H, W = gray_arr.shape
+    # S1 长宽比守恒防护阈值：None 时用模块级默认（AR_GUARD_RATIO_DIFF）
+    guard_tol = AR_GUARD_RATIO_DIFF if aspect_guard_tol is None else float(aspect_guard_tol)
     # 积分图统一构建一次，供 _edge_band_strength 与 2D BVR 复用，
     # 避免每个候选周期/每条路径重复重建整图积分图（大图下 O(H·W) 是热点）
     I_edge = _build_integral(edge_map)
@@ -2167,7 +2446,8 @@ def detect(
                 unified = (period_x + period_y) / 2.0
             px = py = float(unified)
         else:
-            # 3. 差异大：分别使用，但做长宽比校验
+            # 3. 差异大：分别使用，但做长宽比守恒防护（S1 回退链：
+            #    阈值收紧 → 两轴联合再搜索 → 正方形回退保底）
             px = float(period_x)
             py = float(period_y)
             phase_x_t, phase_y_t, conf_t = _phase_search(px, py)
@@ -2177,15 +2457,25 @@ def detect(
                 ratio_out = w_logic_t / h_logic_t
                 ratio_orig = W / H
                 ratio_diff = abs(ratio_out - ratio_orig) / ratio_orig
-                if ratio_diff > 0.3:
-                    # 长宽比畸变：回退为正方形块（取边界强度较高方向的周期，
-                    # SNR 同样受块内纹理污染，边界强度判据更可靠）
-                    e_x = _edge_band_strength(edge_map, px, axis=1, integral=I_edge)
-                    e_y = _edge_band_strength(edge_map, py, axis=0, integral=I_edge)
-                    if e_x >= e_y:
-                        px = py = float(period_x)
+                if ratio_diff > guard_tol:
+                    # 长宽比畸变：先做两轴联合周期再搜索（候选池含梳状连续
+                    # 搜索的非整数 pitch，找回非整数真实块周期组合如
+                    # (9.49, 9.51)，其输出 AR 守恒且边界强度达标）
+                    joint = _ar_joint_research(
+                        sig_x, sig_y, W, H, px, py, edge_map, min_p, max_p,
+                        edge_integral=I_edge, vote_px=vote_px, vote_py=vote_py,
+                    )
+                    if joint is not None:
+                        px, py = joint
                     else:
-                        px = py = float(period_y)
+                        # 再搜索无优解：回退为正方形块（取边界强度较高方向的
+                        # 周期，SNR 同样受块内纹理污染，边界强度判据更可靠）
+                        e_x = _edge_band_strength(edge_map, px, axis=1, integral=I_edge)
+                        e_y = _edge_band_strength(edge_map, py, axis=0, integral=I_edge)
+                        if e_x >= e_y:
+                            px = py = float(period_x)
+                        else:
+                            px = py = float(period_y)
             # 若回退了，下面会重新计算相位；若未回退，也重新计算（统一流程）
 
     # --- Task 5：高分辨率合理性门控（确定最佳周期后、find_phase 前）---

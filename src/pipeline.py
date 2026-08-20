@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -174,6 +174,45 @@ def _quantize_detection_signal(img: np.ndarray, n_colors: int = 16) -> np.ndarra
     return palette[indices].reshape(H, W, 3)
 
 
+def _map_grid_to_scale(grid: Grid, scale: float) -> Grid:
+    """把网格坐标从检测坐标系按线性缩放比映射到目标坐标系。
+
+    大图放大路径的性能保护中，网格检测在放大前原图上执行，检测结果
+    需要映射回放大坐标系供 extract/GUI 消费：
+
+    - ``px``/``py``/``phase_x``/``phase_y`` 与 ``cell_ys``/``cell_xs``
+      线性 ×scale；cell 坐标 ×scale 后理论上 ≤ 放大图尺寸（边界 round
+      误差 ≤1px），extract 内部已有钳位，此处不裁剪；
+    - ``phase`` 恒小于原周期，×scale 后仍小于新周期，映射安全；
+    - ``w_logic``/``h_logic``/``conf``/``low_confidence``/``comb_*``/
+      ``jpeg_grid`` 等元信息字段不变；
+    - ``candidates`` 保留原列表（仅检测过程元信息，不参与下游消费）。
+
+    Args:
+        grid: 检测坐标系下的网格结果。
+        scale: 线性缩放比（>0，nearest ×f 放大取 float(f)）。
+
+    Returns:
+        映射后的新 Grid（``dataclasses.replace`` 构造，字段完整保留，
+        原 grid 不被修改）。
+    """
+    return _dc_replace(
+        grid,
+        px=grid.px * scale,
+        py=grid.py * scale,
+        phase_x=grid.phase_x * scale,
+        phase_y=grid.phase_y * scale,
+        cell_ys=(
+            None if grid.cell_ys is None
+            else np.asarray(grid.cell_ys, dtype=np.float64) * scale
+        ),
+        cell_xs=(
+            None if grid.cell_xs is None
+            else np.asarray(grid.cell_xs, dtype=np.float64) * scale
+        ),
+    )
+
+
 @dataclass
 class PipelineParams:
     """流水线参数。
@@ -196,6 +235,10 @@ class PipelineParams:
             自动减半强度重去噪一次（默认关闭）。
         min_p: 网格检测最小候选周期。
         max_p: 网格检测最大候选周期。
+        detect_max_size: 网格检测输入图的最大边长（像素）。放大后图像超过
+            该值时，网格检测改在放大前的图像上执行，检测完成后网格坐标按
+            缩放比映射回放大坐标系，保证大图放大路径的检测性能；放大后
+            未超限时仍在放大图上检测以保留小图放大的精度收益。
         detect_signal: 网格检测信号模式，``"gray"``（BT.601 灰度）或
             ``"oklab"``（OKLAB 感知色差，等亮度异色块边界可见），默认 gray。
         enable_pre_quantize: 网格检测前是否对检测信号做小调色板预量化（默认关闭）。
@@ -244,6 +287,7 @@ class PipelineParams:
     # 网格检测
     min_p: int = 3
     max_p: int = 40
+    detect_max_size: int = 2048             # 检测输入图最大边长：放大后超限则检测回退原图并映射坐标
     detect_signal: str = "gray"          # 检测信号模式："gray"/"oklab"
     enable_pre_quantize: bool = False          # 检测前对检测信号做小调色板预量化
     user_hint: Optional[tuple[int, int]] = None
@@ -403,22 +447,34 @@ class Pipeline:
         self._stage_done.add("resize")
 
     def _run_grid_detect(self) -> None:
-        img = self._cache["resize"]
+        det_img = self._cache["resize"]
         p = self.params
+
+        # 大图放大路径性能保护：放大后图像 max 边超过 detect_max_size 时，
+        # 网格检测改在放大前（denoise 后）原图上执行，完成后坐标按缩放比
+        # 映射回放大坐标系——nearest 放大下坐标精确 ×f，插值放大下近似
+        # （亚像素误差 <1px）；≤上限保持现状（放大图上检测），保留小图
+        # 放大的精度收益（非整数周期 ×f 后更接近整数）
+        detect_src = det_img
+        scale_map = 1.0
+        f = int(p.upscale_factor) if p.enable_upscale and p.upscale_factor > 1 else 1
+        if f > 1 and max(det_img.shape[:2]) > p.detect_max_size > 0:
+            detect_src = self._cache["denoise_global"]  # 放大前图像
+            scale_map = float(f)
 
         # oklab 色差模式：RGB 直传（预量化若开启则先量化再传），色差信号在
         # detect 内部计算；2D 输入或 gray 模式保持原灰度路径不变
-        use_oklab = p.detect_signal == "oklab" and img.ndim == 3
+        use_oklab = p.detect_signal == "oklab" and detect_src.ndim == 3
         if use_oklab:
-            detect_input = _quantize_detection_signal(img, n_colors=16) if p.enable_pre_quantize else img
+            detect_input = _quantize_detection_signal(detect_src, n_colors=16) if p.enable_pre_quantize else detect_src
             # stages 缓存 "gray" 语义与灰度模式一致：缓存检测信号的 BT.601 灰度
             gray = to_gray(detect_input)
             signal = "oklab"
         else:
-            gray = to_gray(img)
+            gray = to_gray(detect_src)
             # 可选预量化：仅对"检测信号"做小调色板量化，提升低对比度边缘可检测性
             if p.enable_pre_quantize:
-                gray = to_gray(_quantize_detection_signal(img, n_colors=16))
+                gray = to_gray(_quantize_detection_signal(detect_src, n_colors=16))
             detect_input = gray
             signal = "gray"
 
@@ -441,8 +497,14 @@ class Pipeline:
                 jpeg_grid_guard=p.jpeg_grid_guard,
             )
 
-        # grid 坐标在 resize 图坐标系，extract 也用 resize 图，无需映射回原图
+        # 检测在原图执行时，把网格坐标映射回放大（resize）坐标系，保证
+        # extract/GUI 消费的 resize 图与网格坐标系一致
+        if scale_map != 1.0:
+            grid = _map_grid_to_scale(grid, scale_map)
+
         self._cache["grid_detect"] = grid
+        # 缓存实际检测图（detect_src）的灰度（语义：检测用灰度；extract
+        # 不消费 "gray"，输入源为 resize 图 + 映射后网格，坐标一致）
         self._cache["gray"] = gray  # 复用已计算的灰度，避免重复 to_gray（B12）
         self._stage_done.add("grid_detect")
 
