@@ -16,12 +16,13 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QSpinBox, QColorDialog, QScrollArea, QFrame, QToolBar, QStatusBar,
+    QSpinBox, QSlider, QScrollArea, QFrame, QToolBar, QStatusBar,
     QToolButton, QButtonGroup, QCheckBox, QComboBox,
 )
 
 from ..core.asset_manager import AssetManager
 from ..core.io import save_image
+from .color_wheel import ColorWheel
 
 
 class PixelCanvas(QWidget):
@@ -1116,18 +1117,34 @@ class PixelEditor(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        # 前景色/背景色
+        # 色轮（HSV）：位于前景色上方，直接选色替代弹窗；配合亮度滑杆调节 V
+        self._active_slot = "fg"  # 色轮当前编辑的色槽："fg" 前景 / "bg" 背景
+        self._wheel = ColorWheel(160)
+        layout.addWidget(self._wheel)
+
+        layout.addWidget(QLabel("亮度:"))
+        self._brightness = QSlider(Qt.Orientation.Horizontal)
+        self._brightness.setRange(0, 255)
+        layout.addWidget(self._brightness)
+        self._brightness.valueChanged.connect(self._on_brightness_changed)
+
+        # 前景色/背景色：点击切换色轮编辑目标（不再弹窗选色）
         layout.addWidget(QLabel("前景色:"))
         self.fg_color_btn = QPushButton()
         self.fg_color_btn.setFixedSize(180, 40)
-        self.fg_color_btn.clicked.connect(self._pick_fg_color)
+        self.fg_color_btn.clicked.connect(lambda: self._activate_color_slot("fg"))
         layout.addWidget(self.fg_color_btn)
 
         layout.addWidget(QLabel("背景色:"))
         self.bg_color_btn = QPushButton()
         self.bg_color_btn.setFixedSize(180, 40)
-        self.bg_color_btn.clicked.connect(self._pick_bg_color)
+        self.bg_color_btn.clicked.connect(lambda: self._activate_color_slot("bg"))
         layout.addWidget(self.bg_color_btn)
+
+        # 色轮取色 → 写入当前色槽；取色结束（松开）→ 记录最近颜色
+        self._wheel.colorChanged.connect(self._on_wheel_changed)
+        self._wheel.picked.connect(self._on_wheel_picked)
+        self._sync_wheel_from_active()
 
         # 交换前景/背景色（X）
         self.swap_btn = QPushButton("交换前/背景 (X)")
@@ -1380,27 +1397,51 @@ class PixelEditor(QMainWindow):
             btns[idx].setChecked(True)
         self.status.showMessage(f"工具: {tool}")
 
-    def _pick_fg_color(self) -> None:
-        color = QColorDialog.getColor(self.canvas.get_fg_color(), self, "选择前景色")
-        if color.isValid():
+    def _on_wheel_changed(self, color: QColor) -> None:
+        """色轮取色：写入当前编辑的色槽（前景/背景）。"""
+        if self._active_slot == "fg":
             self.canvas.set_fg_color(color)
-            self._update_color_buttons()
+        else:
+            self.canvas.set_bg_color(color)
+        self._update_color_buttons()
+
+    def _on_wheel_picked(self, color: QColor) -> None:
+        """色轮取色完成（松开鼠标）：前景色记录到最近颜色。"""
+        if self._active_slot == "fg":
             self._add_recent_color(color)
 
-    def _pick_bg_color(self) -> None:
-        color = QColorDialog.getColor(self.canvas.get_bg_color(), self, "选择背景色")
-        if color.isValid():
-            self.canvas.set_bg_color(color)
-            self._update_color_buttons()
+    def _on_brightness_changed(self, value: int) -> None:
+        """亮度滑杆：调节色轮当前色槽的 V 分量（set_brightness 会回发 colorChanged）。"""
+        self._wheel.set_brightness(value)
+
+    def _activate_color_slot(self, slot: str) -> None:
+        """切换色轮编辑目标（前景/背景），色轮同步显示该槽颜色。"""
+        self._active_slot = slot
+        self._sync_wheel_from_active()
+
+    def _sync_wheel_from_active(self) -> None:
+        """把色轮与亮度滑杆同步到当前色槽颜色（不触发 colorChanged 回写）。"""
+        c = (
+            self.canvas.get_fg_color()
+            if self._active_slot == "fg"
+            else self.canvas.get_bg_color()
+        )
+        self._wheel.set_color(c)
+        self._brightness.blockSignals(True)
+        self._brightness.setValue(c.value())
+        self._brightness.blockSignals(False)
+        self._update_color_buttons()
 
     def _update_color_buttons(self) -> None:
         fg = self.canvas.get_fg_color()
         bg = self.canvas.get_bg_color()
+        fg_border = "#3d5a80" if self._active_slot == "fg" else "#555"
+        bg_border = "#3d5a80" if self._active_slot == "bg" else "#555"
         self.fg_color_btn.setStyleSheet(
-            f"background: {fg.name()}; border: 2px solid #555; border-radius: 4px;"
+            f"background: {fg.name()}; border: 2px solid {fg_border}; border-radius: 4px;"
         )
         self.bg_color_btn.setStyleSheet(
-            f"background: {bg.name()}; border: 2px solid #555; border-radius: 4px;"
+            f"background: {bg.name()}; border: 2px solid {bg_border}; border-radius: 4px;"
         )
 
     def _add_recent_color(self, color: QColor) -> None:
@@ -1433,8 +1474,8 @@ class PixelEditor(QMainWindow):
         self.brush_spin.setValue(new_size)
 
     def _on_pixel_edited(self) -> None:
-        """画布编辑时更新颜色按钮。"""
-        self._update_color_buttons()
+        """画布编辑时更新颜色按钮，并同步色轮到当前色槽（吸管/右键取色/交换）。"""
+        self._sync_wheel_from_active()
 
     def _on_cursor_moved(self) -> None:
         """光标在画布移动：刷新状态栏（含工具与像素信息）。"""

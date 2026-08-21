@@ -72,5 +72,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='v1_2_0',
+    name='v1_2_1',
 )

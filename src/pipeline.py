@@ -263,7 +263,7 @@ class PipelineParams:
             能量比」作为边界强度分（内部洁净度，P0）：块内干净度作为负向
             判据压制子谐波/倍频误检，直击真实 AI 图边界区分度不足问题
             （默认关闭，开启需复核各图精度）。
-        extract_method: 块提取代表色算法，``"median"``/``"mean"``/``"mode"``/``"kmeans"``。
+        extract_method: 块提取代表色算法，``"median"``/``"mean"``/``"mode"``/``"kmeans"``/``"dominant"``。
         extract_core_ratio: 块核心区采样比例（0.5-1.0），规避边缘杂色。
         fix_square: 当逻辑分辨率与正方形差 1 时，自动修正为正方形输出。
         enable_palette_refine: 是否对提取结果做 K-means 调色板精炼。
@@ -306,7 +306,7 @@ class PipelineParams:
     jpeg_grid_guard: bool = True             # JPEG 8×8 网格检测与候选降权（默认开启）
     enable_interior_cleanliness: bool = False  # P0：边界评分用边界/格心边缘能量比（内部洁净度）压制子谐波误检（默认关闭）
     # 块提取
-    extract_method: str = "kmeans"              # "median"/"mean"/"mode"/"kmeans"
+    extract_method: str = "dominant"            # "median"/"mean"/"mode"/"kmeans"/"dominant"
     extract_core_ratio: float = 0.6            # 0.5-1.0
     # 正方形修正
     fix_square: bool = False
