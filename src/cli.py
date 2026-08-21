@@ -23,8 +23,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--extract-method",
         choices=["median", "mean", "mode", "kmeans", "dominant"],
-        default="median",
-        help="块提取代表色算法：median（默认，与 GUI 一致）/mean/mode/kmeans/dominant",
+        default="kmeans",
+        help="块提取代表色算法：kmeans（默认，与 GUI 一致）/median/mean/mode/dominant",
     )
     parser.add_argument(
         "--extract-core-ratio",
@@ -97,9 +97,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--upscale-method",
-        choices=["nearest", "bilinear", "bicubic", "lanczos"],
-        default="nearest",
-        help="放大算法（默认nearest）",
+        choices=["bilinear", "bicubic", "lanczos"],
+        default="bilinear",
+        help="放大算法（默认bilinear，最近邻已移除）",
     )
     parser.add_argument(
         "--detect-max-size",
@@ -126,22 +126,6 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.5,
         help="锐化强度（0.0-1.0，默认 0.5）",
-    )
-    parser.add_argument(
-        "--clahe",
-        action="store_true",
-        help="启用 CLAHE 局部对比度增强（默认禁用）",
-    )
-    parser.add_argument(
-        "--no-clahe",
-        action="store_true",
-        help="禁用 CLAHE（显式指定，默认禁用）",
-    )
-    parser.add_argument(
-        "--clahe-clip-limit",
-        type=float,
-        default=0.03,
-        help="CLAHE 裁剪限制（0.01-0.1，默认0.03）",
     )
     parser.add_argument(
         "--no-palette-refine",
@@ -212,6 +196,13 @@ def main(argv: list[str] | None = None) -> int:
         help="禁用 JPEG 8×8 压缩网格检测与候选降权（默认开启）：交叉差分投票检测"
         " JPEG DCT 网格相位，显著时对 8/16/24px 附近候选降权，防护压缩伪影周期误检",
     )
+    parser.add_argument(
+        "--interior-cleanliness",
+        action="store_true",
+        help="启用内部洁净度边界评分（P0，默认关闭）：周期投票的边界强度分改用"
+        "边界/格心边缘能量比，以块内干净度压制子谐波/倍频误检——直击真实 AI 图"
+        "边界区分度不足问题",
+    )
     args = parser.parse_args(argv)
 
     import time
@@ -223,14 +214,11 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         print(f"错误: {e}", file=sys.stderr)
         return 1
-    enable_clahe = args.clahe and not args.no_clahe
     params = PipelineParams(
         extract_method=args.extract_method,
         extract_core_ratio=args.extract_core_ratio,
         ai_denoise_method=("none" if args.no_denoise else args.denoise),
         ai_denoise_strength=args.strength,
-        enable_clahe=enable_clahe,
-        clahe_clip_limit=args.clahe_clip_limit,
         min_p=args.grid_min,
         max_p=args.grid_max,
         detect_signal=args.detect_signal,
@@ -256,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_peak_lattice_fit=not args.no_peak_lattice_fit,
         enable_comb_energy_score=not args.no_comb_energy_score,
         jpeg_grid_guard=not args.no_jpeg_grid_guard,
+        enable_interior_cleanliness=args.interior_cleanliness,
     )
     pipeline = Pipeline(params)
     try:

@@ -113,27 +113,16 @@ class _DenoisePage(_StagePage):
         self.method.addItem("TV-Chambolle", "tv_chambolle")
         self.method.addItem("双边滤波 (bilateral)", "bilateral")
         self.strength = _LabeledSlider(0.0, 1.0, scale=100)
-        self.enable_clahe = QCheckBox("启用 CLAHE 局部对比度增强")
-        self.enable_clahe.setChecked(False)
-        self.clahe_clip_limit = QDoubleSpinBox()
-        self.clahe_clip_limit.setRange(0.01, 0.1)
-        self.clahe_clip_limit.setSingleStep(0.01)
-        self.clahe_clip_limit.setDecimals(2)
-        self.clahe_clip_limit.setValue(0.03)
         self.enable_aa_removal = QCheckBox("抗锯齿消除（清理块边界/网格线 AA 杂色）")
         self.enable_aa_removal.setChecked(False)
         self.denoise_grid_guard = QCheckBox("去噪网格保护（去噪过强时自动减半强度重去噪）")
         self.denoise_grid_guard.setChecked(False)
         self.form.addRow("降噪方法", self.method)
         self.form.addRow("降噪强度", self.strength)
-        self.form.addRow(self.enable_clahe)
-        self.form.addRow("CLAHE 裁剪限制", self.clahe_clip_limit)
         self.form.addRow(self.enable_aa_removal)
         self.form.addRow(self.denoise_grid_guard)
         self.method.currentIndexChanged.connect(self._on_changed)
         self.strength.valueChanged().connect(self._on_changed)
-        self.enable_clahe.stateChanged.connect(self._on_changed)
-        self.clahe_clip_limit.valueChanged.connect(self._on_changed)
         self.enable_aa_removal.stateChanged.connect(self._on_changed)
         self.denoise_grid_guard.stateChanged.connect(self._on_changed)
 
@@ -142,34 +131,24 @@ class _DenoisePage(_StagePage):
         self._params.enable_ai_denoise = data != "none"
         self._params.ai_denoise_method = data
         self._params.ai_denoise_strength = self.strength.value()
-        self._params.enable_clahe = self.enable_clahe.isChecked()
-        self._params.clahe_clip_limit = self.clahe_clip_limit.value()
         self._params.enable_aa_removal = self.enable_aa_removal.isChecked()
         self._params.denoise_grid_guard = self.denoise_grid_guard.isChecked()
         self._emit_changed()
-        self.clahe_clip_limit.setEnabled(self.enable_clahe.isChecked())
 
     def sync_from_params(self) -> None:
         p = self._params
         method = p.ai_denoise_method if p.enable_ai_denoise else "none"
         self.method.blockSignals(True)
-        self.enable_clahe.blockSignals(True)
-        self.clahe_clip_limit.blockSignals(True)
         self.enable_aa_removal.blockSignals(True)
         self.denoise_grid_guard.blockSignals(True)
         idx = self.method.findData(method)
         self.method.setCurrentIndex(idx if idx >= 0 else 0)
-        self.enable_clahe.setChecked(p.enable_clahe)
-        self.clahe_clip_limit.setValue(p.clahe_clip_limit)
         self.enable_aa_removal.setChecked(p.enable_aa_removal)
         self.denoise_grid_guard.setChecked(p.denoise_grid_guard)
         self.method.blockSignals(False)
-        self.enable_clahe.blockSignals(False)
-        self.clahe_clip_limit.blockSignals(False)
         self.enable_aa_removal.blockSignals(False)
         self.denoise_grid_guard.blockSignals(False)
         self.strength.set_value(p.ai_denoise_strength)
-        self.clahe_clip_limit.setEnabled(self.enable_clahe.isChecked())
 
 
 class _ResizePage(_StagePage):
@@ -180,7 +159,6 @@ class _ResizePage(_StagePage):
         self.enable = QCheckBox("启用放大（提升网格检测分辨率）")
         self.enable.setChecked(False)
         self.upscale_method = QComboBox()
-        self.upscale_method.addItem("最近邻 (nearest)", "nearest")
         self.upscale_method.addItem("双线性 (bilinear)", "bilinear")
         self.upscale_method.addItem("双三次 (bicubic)", "bicubic")
         self.upscale_method.addItem("Lanczos", "lanczos")
@@ -279,18 +257,8 @@ class _GridDetectPage(_StagePage):
         self.min_p.setRange(2, 100)
         self.max_p = QSpinBox()
         self.max_p.setRange(2, 200)
-        self.snr_threshold = QDoubleSpinBox()
-        self.snr_threshold.setRange(1.0, 50.0)
-        self.snr_threshold.setSingleStep(0.5)
-        self.snr_threshold.setDecimals(1)
-        self.snr_threshold.setValue(8.0)
         self.form.addRow("最小周期 min_p", self.min_p)
         self.form.addRow("最大周期 max_p", self.max_p)
-        self.form.addRow("SNR 阈值", self.snr_threshold)
-        self.edge_tol = QSpinBox()
-        self.edge_tol.setRange(1, 10)
-        self.edge_tol.setValue(3)
-        self.form.addRow("边缘搜索容差", self.edge_tol)
         self.subpixel_refine = QCheckBox("启用亚像素精炼")
         self.subpixel_refine.setChecked(True)
         self.form.addRow(self.subpixel_refine)
@@ -306,31 +274,22 @@ class _GridDetectPage(_StagePage):
         self.outlier_reject_ratio.setDecimals(1)
         self.outlier_reject_ratio.setValue(0.5)
         self.form.addRow("离群剔除比例", self.outlier_reject_ratio)
-        self.fix_square = QCheckBox("正方形修正（差1时自动修正为正方形）")
-        self.fix_square.setChecked(False)
-        self.form.addRow(self.fix_square)
         self.enable_pre_quantize = QCheckBox("检测前预量化（小调色板量化提升低对比度边缘可检测性）")
         self.enable_pre_quantize.setChecked(False)
         self.form.addRow(self.enable_pre_quantize)
         self.min_p.valueChanged.connect(self._on_changed)
         self.max_p.valueChanged.connect(self._on_changed)
-        self.snr_threshold.valueChanged.connect(self._on_changed)
-        self.edge_tol.valueChanged.connect(self._on_changed)
         self.subpixel_refine.toggled.connect(self._on_changed)
         self.smooth_strength.valueChanged.connect(self._on_changed)
         self.outlier_reject_ratio.valueChanged.connect(self._on_changed)
-        self.fix_square.stateChanged.connect(self._on_changed)
         self.enable_pre_quantize.stateChanged.connect(self._on_changed)
 
     def _on_changed(self, *args) -> None:
         self._params.min_p = self.min_p.value()
         self._params.max_p = self.max_p.value()
-        self._params.snr_threshold = self.snr_threshold.value()
-        self._params.edge_search_tolerance = self.edge_tol.value()
         self._params.enable_subpixel_refine = self.subpixel_refine.isChecked()
         self._params.smooth_strength = self.smooth_strength.value()
         self._params.outlier_reject_ratio = self.outlier_reject_ratio.value()
-        self._params.fix_square = self.fix_square.isChecked()
         self._params.enable_pre_quantize = self.enable_pre_quantize.isChecked()
         self._emit_changed()
 
@@ -338,30 +297,21 @@ class _GridDetectPage(_StagePage):
         p = self._params
         self.min_p.blockSignals(True)
         self.max_p.blockSignals(True)
-        self.snr_threshold.blockSignals(True)
-        self.edge_tol.blockSignals(True)
         self.subpixel_refine.blockSignals(True)
         self.smooth_strength.blockSignals(True)
         self.outlier_reject_ratio.blockSignals(True)
-        self.fix_square.blockSignals(True)
         self.enable_pre_quantize.blockSignals(True)
         self.min_p.setValue(p.min_p)
         self.max_p.setValue(p.max_p)
-        self.snr_threshold.setValue(p.snr_threshold)
-        self.edge_tol.setValue(p.edge_search_tolerance)
         self.subpixel_refine.setChecked(p.enable_subpixel_refine)
         self.smooth_strength.setValue(p.smooth_strength)
         self.outlier_reject_ratio.setValue(p.outlier_reject_ratio)
-        self.fix_square.setChecked(p.fix_square)
         self.enable_pre_quantize.setChecked(p.enable_pre_quantize)
         self.min_p.blockSignals(False)
         self.max_p.blockSignals(False)
-        self.snr_threshold.blockSignals(False)
-        self.edge_tol.blockSignals(False)
         self.subpixel_refine.blockSignals(False)
         self.smooth_strength.blockSignals(False)
         self.outlier_reject_ratio.blockSignals(False)
-        self.fix_square.blockSignals(False)
         self.enable_pre_quantize.blockSignals(False)
 
 
@@ -371,11 +321,11 @@ class _ExtractPage(_StagePage):
     def __init__(self, panel, stage_name, parent=None):
         super().__init__(panel, stage_name, "块提取")
         self.method = QComboBox()
+        self.method.addItem("K-means (kmeans)", "kmeans")
         self.method.addItem("中位数 (median)", "median")
         self.method.addItem("主色 (dominant)", "dominant")
         self.method.addItem("均值 (mean)", "mean")
         self.method.addItem("众数 (mode)", "mode")
-        self.method.addItem("K-means (kmeans)", "kmeans")
         self.core_ratio = _LabeledSlider(0.5, 1.0, scale=100)
         self.form.addRow("代表色算法", self.method)
         self.form.addRow("核心区比例", self.core_ratio)
@@ -490,7 +440,8 @@ class ParamPanel(QWidget):
         self._scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; }"
             "QScrollArea > QWidget > QWidget { background: transparent; }"
-            # 滚动条：窄（8px）、深色背景、主题蓝 handle
+            # 滚动条：窄（8px）、深色背景、主题蓝 handle（垂直与底部水平一致，
+            # 避免底部水平滑动条落回系统默认浅色背景）
             "QScrollArea QScrollBar:vertical { background: #2d2d2d; width: 8px;"
             "  border-radius: 4px; margin: 2px; }"
             "QScrollArea QScrollBar::handle:vertical { background: #4a9eff;"
@@ -500,6 +451,15 @@ class ParamPanel(QWidget):
             "QScrollArea QScrollBar::sub-line:vertical { height: 0; }"
             "QScrollArea QScrollBar::add-page:vertical,"
             "QScrollArea QScrollBar::sub-page:vertical { background: transparent; }"
+            "QScrollArea QScrollBar:horizontal { background: #2d2d2d; height: 8px;"
+            "  border-radius: 4px; margin: 2px; }"
+            "QScrollArea QScrollBar::handle:horizontal { background: #4a9eff;"
+            "  border-radius: 4px; min-width: 32px; }"
+            "QScrollArea QScrollBar::handle:horizontal:hover { background: #5fb0ff; }"
+            "QScrollArea QScrollBar::add-line:horizontal,"
+            "QScrollArea QScrollBar::sub-line:horizontal { width: 0; }"
+            "QScrollArea QScrollBar::add-page:horizontal,"
+            "QScrollArea QScrollBar::sub-page:horizontal { background: transparent; }"
         )
         content = QWidget()
         content_layout = QVBoxLayout(content)

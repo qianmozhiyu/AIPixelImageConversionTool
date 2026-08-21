@@ -544,6 +544,84 @@ def _edge_band_strength(
     return float(best)
 
 
+def _boundary_interior_ratio(
+    em: np.ndarray,
+    period: float,
+    axis: int = 0,
+    phases: Sequence[float] | None = None,
+    integral: np.ndarray | None = None,
+) -> float:
+    """边界/格心边缘能量比（内部洁净度增量判据）。
+
+    真实像素网格应有「块边界强边缘、块内干净」的结构；子谐波(P/k)的网格线
+    一半落真边界、一半落入真块内部，其格心带会采到真边界边缘（内部脏），
+    而真周期 P 的格心带只有块内 AA 噪声（干净）。故 ratio = 边界带均值 /
+    格心带均值 在真周期处显著高于子谐波/倍频——这正是 crispx「内部洁净度」
+    的负向判据，直击真实 AI 图「边界强度区分度不足(≈1.0)」的根因：纯边界带
+    能量在真/假周期间区分度弱，加入格心带归一化后把「内部是否干净」变成
+    判别主轴。
+
+    采样沿用 ``_edge_band_strength`` 的积分图 O(1) 条带方式：对每个候选
+    (period, phase)，边界条带取整数边界位置 1px，格心条带取块中心 1px。
+    同样扫 ``_default_edge_band_phases`` 的 4 相位，取最大比值（与边界带
+    强度语义一致：相位对齐处比值最高）。
+
+    Args:
+        em: 边缘强度图 (H, W)，值域 [0,1]。
+        period: 候选周期（像素）。
+        axis: 0=检测 y 方向周期（水平边界），1=检测 x 方向周期（垂直边界）。
+        phases: 显式相位集合；None 时用默认 4 相位。
+        integral: ``em`` 的 (H+1, W+1) 积分图；None 时内部构建。
+
+    Returns:
+        边界/格心边缘能量比（>0）。格心完全干净时返回大值（强偏好），
+        无法计算时返回 0.0。
+    """
+    em = np.asarray(em, dtype=np.float64)
+    if em.ndim != 2:
+        return 0.0
+    H, W = em.shape
+    p = float(period)
+    if p < 2:
+        return 0.0
+    I = integral if integral is not None else _build_integral(em)
+    length = W if axis == 1 else H
+    best = 0.0
+    has_data = False
+    for phase in _default_edge_band_phases(p) if phases is None else tuple(phases):
+        n = int((length - phase) // p)
+        if n < 2:
+            continue
+        b_total = i_total = 0.0
+        b_count = i_count = 0
+        for m in range(n + 1):
+            b0 = int(round(phase + m * p))
+            b1 = b0 + 1
+            c0 = int(round(phase + (m + 0.5) * p))
+            c1 = c0 + 1
+            if axis == 1:  # x 方向：垂直条带（列）
+                if 0 <= b0 < b1 <= W:
+                    b_total += I[H, b1] - I[H, b0]
+                    b_count += 1
+                if 0 <= c0 < c1 <= W:
+                    i_total += I[H, c1] - I[H, c0]
+                    i_count += 1
+            else:  # axis=0: y 方向：水平条带（行）
+                if 0 <= b0 < b1 <= H:
+                    b_total += I[b1, W] - I[b0, W]
+                    b_count += 1
+                if 0 <= c0 < c1 <= H:
+                    i_total += I[c1, W] - I[c0, W]
+                    i_count += 1
+        if b_count > 0 and i_count > 0:
+            b_mean = b_total / b_count
+            i_mean = i_total / i_count
+            ratio = b_mean / max(i_mean, 1e-9)
+            best = max(best, ratio)
+            has_data = True
+    return float(best) if has_data else 0.0
+
+
 def _spectral_comb_score(profile: np.ndarray, period: int, n_harmonics: int = 8) -> float:
     """Spectral Comb 周期得分：谐波梳状能量 / 带内中位能量。
 
@@ -1399,6 +1477,7 @@ def _vote_period(
     gray_integral: np.ndarray | None = None,
     gray_integral_sq: np.ndarray | None = None,
     jpeg_penalty: bool = False,
+    use_interior_ratio: bool = False,
 ) -> tuple[float, float]:
     """多判据投票选最佳周期，返回 (period, confidence)。
 
@@ -1512,8 +1591,16 @@ def _vote_period(
             fft_score = min(max(amp / band_max, 0.0), 1.0)
         else:
             fft_score = 0.0
-        # 边界带边缘强度（廉价：积分图 + 条带求和）
-        edge = _edge_band_strength(edge_map, float(c), axis=axis, integral=I_edge) if edge_map is not None else 0.0
+        # 边界带边缘强度（廉价：积分图 + 条带求和）。use_interior_ratio 时
+        # 改用「边界/格心边缘能量比」（_boundary_interior_ratio）——块内干净
+        # 度作为负向判据，子谐波/倍频的格心带采到真边界而内部脏，比值被压制
+        if edge_map is not None:
+            if use_interior_ratio:
+                edge = _boundary_interior_ratio(edge_map, float(c), axis=axis, integral=I_edge)
+            else:
+                edge = _edge_band_strength(edge_map, float(c), axis=axis, integral=I_edge)
+        else:
+            edge = 0.0
         # G5 JPEG 网格防护：8/16/24 ±1 候选降权（归一化前施加，惩罚进入
         # 归一化基准 max_edge，实现候选间相对降权；JPEG 伪影固定 8px 周期
         # 会在这些候选处系统性抬高边界强度）
@@ -2195,6 +2282,7 @@ def detect(
     enable_comb_energy_score: bool = False,
     jpeg_grid_guard: bool = False,
     aspect_guard_tol: float | None = None,
+    enable_interior_cleanliness: bool = False,
 ) -> Grid:
     """自动检测像素网格。
 
@@ -2253,6 +2341,12 @@ def detect(
             pitch，可找回 (9.49, 9.51) 这类真实非整数块组合），无优解
             再回退正方形块。None 时用模块级 ``AR_GUARD_RATIO_DIFF``
             （0.12；旧硬编码 0.3 过松，slice_06 的 20.2% 畸变被放过）。
+        enable_interior_cleanliness: 是否启用「内部洁净度」边界评分（P0，
+            默认 False，零回归）。True 时 ``_vote_period`` 的边界强度分
+            改用边界/格心边缘能量比（``_boundary_interior_ratio``），
+            以「块内是否干净」为负向判据压制子谐波/倍频——削弱真实 AI
+            图纯边界能量区分度不足(≈1.0)带来的误检。默认 False 完全兼容
+            既有行为。
 
     Returns:
         Grid: 检测结果。
@@ -2336,13 +2430,13 @@ def detect(
         gray_arr, sig_x, min_p, max_p, axis=1, edge_map=edge_map,
         comb_weight=comb_weight, use_comb_prefilter=use_comb_prefilter,
         edge_integral=I_edge, gray_integral=I_gray, gray_integral_sq=I_gray_sq,
-        jpeg_penalty=jpeg_penalty_flag,
+        jpeg_penalty=jpeg_penalty_flag, use_interior_ratio=enable_interior_cleanliness,
     )
     vote_py, conf_y = _vote_period(
         gray_arr, sig_y, min_p, max_p, axis=0, edge_map=edge_map,
         comb_weight=comb_weight, use_comb_prefilter=use_comb_prefilter,
         edge_integral=I_edge, gray_integral=I_gray, gray_integral_sq=I_gray_sq,
-        jpeg_penalty=jpeg_penalty_flag,
+        jpeg_penalty=jpeg_penalty_flag, use_interior_ratio=enable_interior_cleanliness,
     )
     # 投票结果覆盖 FFT：置信度高，或边界强度显著更高
     # （FFT 主峰易被块内纹理污染，而边界带边缘强度判据不受其影响；

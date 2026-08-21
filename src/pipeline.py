@@ -225,7 +225,7 @@ class PipelineParams:
         clahe_clip_limit: CLAHE 裁剪限制（0.01-0.1）。
         enable_upscale: 是否在降噪后启用放大以提升网格检测分辨率。
         upscale_factor: 放大倍数（默认 2）。
-        upscale_method: 放大算法，``"nearest"``/``"bilinear"``/``"bicubic"``/``"lanczos"``。
+        upscale_method: 放大算法，``"bilinear"``（默认）``/``bicubic``/``lanczos``（最近邻已从前端移除）。
         enable_sharpen: 是否对放大结果做 unsharp mask 锐化（默认关闭，因有白边风险）。
         sharpen_strength: 锐化强度，0.0-1.0。
         enable_aa_removal: 降噪后是否启用抗锯齿消除预处理（默认关闭）。
@@ -259,6 +259,10 @@ class PipelineParams:
         jpeg_grid_guard: JPEG 8×8 压缩网格检测与候选降权（G5）：检测 JPEG
             8×8 DCT 网格并对 8/16/24px 附近候选降权，防护压缩伪影周期误检
             （默认开启）。
+        enable_interior_cleanliness: 网格检测周期投票时用「边界/格心边缘
+            能量比」作为边界强度分（内部洁净度，P0）：块内干净度作为负向
+            判据压制子谐波/倍频误检，直击真实 AI 图边界区分度不足问题
+            （默认关闭，开启需复核各图精度）。
         extract_method: 块提取代表色算法，``"median"``/``"mean"``/``"mode"``/``"kmeans"``。
         extract_core_ratio: 块核心区采样比例（0.5-1.0），规避边缘杂色。
         fix_square: 当逻辑分辨率与正方形差 1 时，自动修正为正方形输出。
@@ -275,7 +279,7 @@ class PipelineParams:
     # 放大与锐化
     enable_upscale: bool = False               # 降噪后是否放大
     upscale_factor: int = 2                    # 放大倍数
-    upscale_method: str = "nearest"          # 放大算法："nearest"/"bilinear"/"bicubic"/"lanczos"
+    upscale_method: str = "bilinear"         # 放大算法："bilinear"/"bicubic"/"lanczos"（最近邻已移除）
     enable_sharpen: bool = False               # 是否启用 unsharp mask 锐化（默认关闭）
     sharpen_strength: float = 0.5              # 锐化强度 0.0-1.0
     # 抗锯齿消除（默认关闭）
@@ -300,8 +304,9 @@ class PipelineParams:
     enable_peak_lattice_fit: bool = True     # 投票后峰值格点拟合周期精化（默认开启，含轴一致性防护）
     enable_comb_energy_score: bool = True    # 梳状能量集中度周期终审（默认开启）
     jpeg_grid_guard: bool = True             # JPEG 8×8 网格检测与候选降权（默认开启）
+    enable_interior_cleanliness: bool = False  # P0：边界评分用边界/格心边缘能量比（内部洁净度）压制子谐波误检（默认关闭）
     # 块提取
-    extract_method: str = "median"              # "median"/"mean"/"mode"/"kmeans"
+    extract_method: str = "kmeans"              # "median"/"mean"/"mode"/"kmeans"
     extract_core_ratio: float = 0.6            # 0.5-1.0
     # 正方形修正
     fix_square: bool = False
@@ -495,6 +500,7 @@ class Pipeline:
                 enable_peak_lattice_fit=p.enable_peak_lattice_fit,
                 enable_comb_energy_score=p.enable_comb_energy_score,
                 jpeg_grid_guard=p.jpeg_grid_guard,
+                enable_interior_cleanliness=p.enable_interior_cleanliness,
             )
 
         # 检测在原图执行时，把网格坐标映射回放大（resize）坐标系，保证
